@@ -1,59 +1,125 @@
-# EasyMarket [易购](https://github.com/Peroluo/easyMarketApp)
+# react-cli-template
 
-> ​EasyMarket 是仿网易严选 UI 设计的 H5 webApp。项目是基于 React+Redux+Redux-saga+Axios+React-router。
-> ​EasyMarket 采用阿里 antd-design-mobile 的 UI 组件。
+> 1. react-cli-template 基于 Webpack4+搭建的 React 脚手架。
+> 2. 支持 TypeScript 与 JavaScript 共存，解决项目向 TS 靠拢问题。
+> 3. Css 预处理已配置 Less，可根据自己需求，配置 Sass、Styuls。
+> 4. 数据管理已配置 Redux 与 Rematch、路由使用 React-router-dom。
 
-## EasyMarket 扫码预览
+## Quick Start
 
-#### 微信浏览器，请点击"访问原网页"
+```shell
+git clone https://github.com/Peroluo/react-cli-template.git
+cd react-cli-template
+cnpm install
+```
 
-<figure >
-<img src="./imgs/qrCode.png" width="200"/>
-</figure >
+### npm run dev
 
-## EasyMarket Screenshots
-
-|         首页         |        制造商         |         商品分类         |         收藏商品         |
-| :------------------: | :-------------------: | :----------------------: | :----------------------: |
-| ![](./imgs/home.png) | ![](./imgs/brand.png) | ![](./imgs/category.png) | ![](./imgs/likeList.png) |
-
-|         专题          |          专题详情           |            分类检索            |          商品查询           |
-| :-------------------: | :-------------------------: | :----------------------------: | :-------------------------: |
-| ![](./imgs/topic.png) | ![](./imgs/topicDetail.png) | ![](./imgs/categorySearch.png) | ![](./imgs/goodsSearch.png) |
-
-|        购物车        |          商品详情           |        更多评论         |         我的         |
-| :------------------: | :-------------------------: | :---------------------: | :------------------: |
-| ![](./imgs/cart.png) | ![](./imgs/goodsDetail.png) | ![](./imgs/comment.png) | ![](./imgs/mine.png) |
-
-## EasyMarket Preview
-
-<figure class="third">
-    <img src="./imgs/EasyMarket.gif" width="320"/>
-</figure>
-
-## EasyMarket Tips
-
-> - EasyMarket 正在更新维护状态，部分功能尚未没完成。
-> - 倘若您发现 Bug 或者有优化意见及其他宝贵意见，欢迎您提交 issue 或者联系我 qq = 1025558554 、Email = 1025558554@qq.com
-> - EasyMarket 服务端 ，请移步至 [EasyMarketSever](https://github.com/Peroluo/easyMarketSever)。
-
-## EasyMrket 本地部署
-
-> 1. git clone https://github.com/Peroluo/easyMarketApp.git
-> 2. 安装依赖 cnpm install
-> 3. 修改 package.json 文件中 proxy 字段的值 = 你本地服务器的 ip 地址 （"proxy": "http://127.0.0.1:8888"）
-> 4. 如果老铁不会在本地部署服务端，可以将第三步的 ip 地址，改成我部署的服务 ip 地址（"proxy": "http://202.96.155.121:8888"）,我部署的服务比较低级，避免挂掉，各位老铁，还是在你本地部署个吧~
-> 5. npm start
-> 6. 部署到服务端 npm run build ,将 build 文件夹中的文件放到 [EasyMarketSever](https://github.com/Peroluo/easyMarketSever) 的 www/web/easyMarket 目录中
-
-## EasyMarket 未完成功能
-
-> - 支付订单、订单查询、优惠券...未来会不断完善！
-
-## About Me
-
-> Name: pero 罗
+> 开发模式运行程序
 >
-> QQ: 1025558554
+> 自动打开浏览器 [http://localhost:8080](http://localhost:8080)
 >
-> Email：1025558554@qq.com
+> 开发环境支持热更新，在构建过程中会提醒错误跟警告。
+
+### npm run build
+
+> 生成环境打包
+>
+> 已配置 GZIP、资源压缩、缓存等构建最佳性能，请参考 webpack 相关配置。
+>
+> 构建完成后，将启动静态资源服务，打开浏览器 [http://localhost:8000](http://localhost:8000)
+
+### npm run build --report
+
+> 分析打包后的资源大小
+>
+> 自动打开浏览器 [http://localhost:8888](http://localhost:8888)
+
+### 目录说明
+
+```
+react-cli-template
+├── static                                          静态文件
+├── .babelrc                                        babel配置
+├── jsconfig.json                                   vscode相关配置
+├── postcss.config.js                               postcss配置
+├── tsconfig.json                                   typescript配置
+├── typings.d.ts                                    typings
+├── index.html                                      html模板
+├── .eslintrc.js                                    eslint、tslint配置
+├── build                                           构建相关
+│   ├── build.js                                    production启动
+│   ├── check-versions.js                           npm node版本检测
+│   ├── logo.png                                    提示框logo
+│   ├── utils.js                                    构建工具
+│   ├── webpack.base.conf.js                        webpack公共配置
+│   ├── webpack.dev.conf.js                         webpack开发配置
+│   └── webpack.prod.conf.js                        webpack生成配置
+├── config                                          构建配置
+│   ├── dev.env.js                                  开发配置
+│   ├── index.js                                    配置入口
+│   └── prod.env.js                                 生成配置
+└── src                                             项目入口
+    └── main.js                                     项目入口文件
+```
+
+### 配置文件说明 `config/index.js`
+
+```js
+{
+  dev: {
+    assetsSubDirectory: "static", // 静态文件夹
+    assetsPublicPath: "/", // 静态文件前缀
+    proxyTable: {}, // 代理
+
+    // dev-server配置
+    host: "localhost",
+    port: 8080,
+    autoOpenBrowser: true,
+    errorOverlay: true,
+    notifyOnErrors: true,
+    poll: false, // https://webpack.js.org/configuration/dev-server/#devserver-watchoptions-
+
+    // eslint配置
+    useLint: true, // 是否使用eslint
+    showlintErrorsInOverlay: true, // 错误跟警告是否显示在浏览器上
+
+    devtool: "eval", //https://webpack.js.org/configuration/devtool/#root
+
+    cssSourceMap: true,
+
+    cssModules: true,
+  },
+
+  build: {
+    // Template for index.html
+    index: path.resolve(__dirname, "../dist/index.html"),
+
+    assetsRoot: path.resolve(__dirname, "../dist"), // 静态文件目录
+    assetsSubDirectory: "static", // 静态文件名
+    assetsPublicPath: "/",
+
+    // 是否开启资源预加载
+    usePreload: false,
+
+    productionSourceMap: true,
+
+    devtool: "#source-map",
+
+    // 是否使用GZIP
+    // npm install --save-dev compression-webpack-plugin
+    productionGzip: true,
+
+    // `npm run build --report`
+    // Set to `true` or `false` to always turn it on or off
+    bundleAnalyzerReport: process.env.npm_config_report,
+
+    // 生成环境端口
+    port: 8000,
+
+    // 静态资源缓存时间
+    cacheControl: 24 * 60 * 60 * 1000 * 90,
+  },
+}
+```
+

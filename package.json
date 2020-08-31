@@ -1,44 +1,99 @@
 {
-  "name": "easyMarketApp",
-  "version": "0.1.0",
-  "private": true,
-  "homepage": "./",
-  "dependencies": {
-    "antd-mobile": "^2.2.9",
-    "axios": "^0.18.0",
-    "customize-cra": "^0.2.12",
-    "history": "^4.7.2",
-    "node-sass": "^4.11.0",
-    "prop-types": "^15.6.2",
-    "react": "^16.8.3",
-    "react-dom": "^16.8.3",
-    "react-lazyload": "^2.3.0",
-    "react-redux": "^6.0.0",
-    "react-router-dom": "^4.3.1",
-    "react-scripts": "2.1.5",
-    "react-transition-group": "^2.5.2",
-    "redux": "^4.0.1",
-    "redux-saga": "^0.16.2",
-    "sass-loader": "^7.1.0"
-  },
+  "name": "easy-market-app",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
   "scripts": {
-    "start": "react-app-rewired start",
-    "build": "react-app-rewired build",
-    "test": "react-app-rewired test --env=jsdom",
-    "eject": "react-app-rewired eject"
+    "dev": "webpack-dev-server --inline --progress --config build/webpack.dev.conf.js",
+    "build": "node build/build.js",
+    "report": "npm run build --report",
+    "clean": "rimraf node_modules"
   },
-  "proxy": "http://39.108.84.221:8888",
-  "eslintConfig": {
-    "extends": "react-app"
+  "dependencies": {
+    "@rematch/core": "^1.4.0",
+    "@types/react": "^16.9.38",
+    "@types/react-dom": "^16.9.8",
+    "@types/react-redux": "^7.1.9",
+    "axios": "^0.19.2",
+    "react": "^16.13.1",
+    "react-dom": "^16.13.1",
+    "react-redux": "^7.2.0",
+    "react-router-dom": "^5.2.0"
+  },
+  "devDependencies": {
+    "@babel/cli": "^7.10.1",
+    "@babel/core": "^7.10.2",
+    "@babel/plugin-proposal-class-properties": "^7.10.1",
+    "@babel/plugin-proposal-decorators": "^7.10.3",
+    "@babel/plugin-transform-runtime": "^7.10.3",
+    "@babel/preset-env": "^7.10.2",
+    "@babel/preset-react": "^7.10.1",
+    "@babel/preset-typescript": "^7.10.1",
+    "@babel/runtime-corejs3": "^7.10.3",
+    "@umijs/fabric": "^2.1.1",
+    "autoprefixer": "^9.8.4",
+    "babel-eslint": "^10.1.0",
+    "babel-loader": "^8.1.0",
+    "chalk": "^4.1.0",
+    "compression-webpack-plugin": "^4.0.0",
+    "connect-history-api-fallback": "^1.6.0",
+    "copy-webpack-plugin": "^6.0.2",
+    "core-js": "^3.6.5",
+    "css-loader": "^3.6.0",
+    "eslint": "^7.0.0",
+    "eslint-friendly-formatter": "^4.0.1",
+    "eslint-loader": "^4.0.2",
+    "file-loader": "^6.0.0",
+    "friendly-errors-webpack-plugin": "^1.7.0",
+    "hard-source-webpack-plugin": "^0.13.1",
+    "html-webpack-plugin": "^4.3.0",
+    "koa": "^2.12.1",
+    "koa-compress": "^4.0.1",
+    "koa-static": "^5.0.0",
+    "less-loader": "^6.1.1",
+    "mini-css-extract-plugin": "^0.9.0",
+    "node-notifier": "^7.0.1",
+    "optimize-css-assets-webpack-plugin": "^5.0.3",
+    "ora": "^4.0.4",
+    "postcss-loader": "^3.0.0",
+    "postcss-px-to-viewport": "^1.1.1",
+    "preload-webpack-plugin": "^3.0.0-beta.3",
+    "rimraf": "^3.0.2",
+    "semver": "^7.3.2",
+    "shelljs": "^0.8.4",
+    "ts-loader": "^7.0.5",
+    "typescript": "^3.9.5",
+    "uglifyjs-webpack-plugin": "^2.2.0",
+    "url-loader": "^4.1.0",
+    "webpack": "^4.43.0",
+    "webpack-bundle-analyzer": "^3.8.0",
+    "webpack-cli": "^3.3.11",
+    "webpack-dev-server": "^3.11.0",
+    "webpack-merge": "^4.2.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Peroluo/react-cli-template.git"
+  },
+  "keywords": [
+    "react"
+  ],
+  "author": "peroLuo",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Peroluo/react-cli-template/issues"
+  },
+  "homepage": "https://github.com/Peroluo/react-cli-template#readme",
+  "engines": {
+    "node": ">= 6.0.0",
+    "npm": ">= 3.0.0"
   },
   "browserslist": [
-    ">0.2%",
-    "not dead",
-    "not ie <= 11",
-    "not op_mini all"
-  ],
-  "devDependencies": {
-    "babel-plugin-import": "^1.11.0",
-    "react-app-rewired": "^2.1.0"
-  }
+    "defaults",
+    "not ie < 11",
+    "last 2 versions",
+    "> 1%",
+    "iOS 7",
+    "last 3 iOS versions"
+  ]
 }

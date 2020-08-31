@@ -1,5 +1,24 @@
 {
-  "plugins": [
-    ["import", { "libraryName": "antd-mobile", "style": "css" }] // `style: true` 会加载 less 文件
-  ]
-}
+    "presets": [
+      [
+        "@babel/preset-env",
+        {
+          "useBuiltIns": "usage",
+          "corejs": 3
+        }
+      ],
+      "@babel/preset-react",
+      "@babel/preset-typescript"
+    ],
+    "plugins": [
+      [
+        "@babel/plugin-proposal-decorators",
+        {
+          "legacy": true
+        }
+      ],
+      "@babel/plugin-transform-runtime",
+      "@babel/plugin-proposal-class-properties"
+    ]
+  }
+  
