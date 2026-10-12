@@ -219,8 +219,8 @@ export class AgentRuntime implements Runtime {
       onSessionActivated: key => this.syncExtensionSessionKey(key),
       createCompilation: (request, sessionKey, session, traceId) =>
         this.createCompilation(request, sessionKey, session, traceId),
-      buildUserMessage: request => buildUserMessage(request),
-      buildResult: compilation => buildResult(compilation),
+      buildUserMessage,
+      buildResult,
       transformMessages: (compilation, sessionKey) =>
         this.transformMessages(compilation, sessionKey),
     });
@@ -374,6 +374,23 @@ export class AgentRuntime implements Runtime {
     return request.sessionKey ?? this._sessionKey;
   }
 
+  /** 校验失败路径：上报 errorClass='validation' 的 onRunEnd（不进入排队） */
+  private async emitValidationFailure(request: Request, result: Result): Promise<void> {
+    await this._emitter.emit('onRunEnd', {
+      traceId: this._emitter.newTraceId(),
+      sessionKey: this.resolveSessionKey(request),
+      request,
+      durationMs: 0,
+      activeMs: 0,
+      queuedMs: 0,
+      turnCount: 0,
+      result,
+      success: false,
+      errorClass: 'validation',
+      tokens: { input: 0, output: 0 },
+    });
+  }
+
   /** 当前活跃的会话 key 列表（含默认会话） */
   getSessionKeys(): string[] {
     return this._store.keys();
@@ -392,19 +409,7 @@ export class AgentRuntime implements Runtime {
         .error(`请求校验失败: ${validation.errors.join('; ')}`)
         .build();
       // 校验失败也要可观测（errorClass='validation'），不进入排队
-      await this._emitter.emit('onRunEnd', {
-        traceId: this._emitter.newTraceId(),
-        sessionKey: this.resolveSessionKey(request),
-        request,
-        durationMs: 0,
-        activeMs: 0,
-        queuedMs: 0,
-        turnCount: 0,
-        result: invalidResult,
-        success: false,
-        errorClass: 'validation',
-        tokens: { input: 0, output: 0 },
-      });
+      await this.emitValidationFailure(request, invalidResult);
       return invalidResult;
     }
     const finalRequest = normalizeRequest(request);
@@ -439,19 +444,8 @@ export class AgentRuntime implements Runtime {
     const validation = validateRequest(request);
     if (!validation.valid) {
       const message = `请求校验失败: ${validation.errors.join('; ')}`;
-      await this._emitter.emit('onRunEnd', {
-        traceId: this._emitter.newTraceId(),
-        sessionKey: this.resolveSessionKey(request),
-        request,
-        durationMs: 0,
-        activeMs: 0,
-        queuedMs: 0,
-        turnCount: 0,
-        result: new ResultBuilder().error(message).build(),
-        success: false,
-        errorClass: 'validation',
-        tokens: { input: 0, output: 0 },
-      });
+      // 校验失败也要可观测（errorClass='validation'），不进入排队
+      await this.emitValidationFailure(request, new ResultBuilder().error(message).build());
       yield { type: 'error', content: message };
       yield { type: 'done' };
       return;

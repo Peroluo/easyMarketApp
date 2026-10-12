@@ -25,17 +25,6 @@ function estimateResourceTokens(resource: ContextResource): number {
   }
 }
 
-/** 序列化资源内容为可读文本，用于 token 估算 */
-function resourceText(resource: ContextResource): string {
-  const content = resource.content;
-  if (typeof content === 'string') return content;
-  try {
-    return JSON.stringify(content ?? '');
-  } catch {
-    return '';
-  }
-}
-
 // ─── 工具配对转换器 ───────────────────────────────────────────────
 
 /**

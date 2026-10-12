@@ -13,17 +13,21 @@ import type {
 } from './types';
 import { createEmptyUsage, createEmptyAssistantMessage } from './types';
 import { retry, ok, isRetryableHttpStatus } from './retry';
-import { normalizeResponseError } from './error-body';
 import { resolveApiKey } from './credentials';
 import {
-  AgentError,
   AgentErrorCategory,
   classifyError,
   formatCategoryError,
-  formatHttpError,
 } from './errors';
 import { parseSSEEvents } from './sse-parser';
 import { getSyncPartialParser } from './json-parse';
+import {
+  createErrorEvent,
+  buildRequestErrorEvent,
+  buildResponseErrorEvent,
+  createTimeoutReader,
+  createStreamResult,
+} from './stream-shared';
 
 // ─── Context -> Anthropic 消息 ─────────────────────────────────────
 
@@ -94,7 +98,7 @@ function toAnthropicTools(context: Context): unknown[] | undefined {
 
 // ─── 用量统计 ──────────────────────────────────────────────────────
 
-function buildUsage(inputTokens: number, outputTokens: number, model: Model, cacheReadTokens?: number): Usage {
+function buildUsage(inputTokens: number, outputTokens: number, cacheReadTokens?: number): Usage {
   const usage = createEmptyUsage();
   usage.input = inputTokens;
   usage.output = outputTokens;
@@ -116,15 +120,10 @@ async function* runStream(
     options.env?.ANTHROPIC_OAUTH_TOKEN
     ?? (typeof process !== 'undefined' ? process.env.ANTHROPIC_OAUTH_TOKEN : undefined);
   if (!apiKey && !oauthToken) {
-    const error = createEmptyAssistantMessage();
-    error.model = model.id;
-    error.provider = model.provider;
-    error.stopReason = 'error';
-    error.errorMessage = formatCategoryError(
+    yield createErrorEvent(model, formatCategoryError(
       AgentErrorCategory.AUTH,
       'No API key found for Anthropic (ANTHROPIC_API_KEY)',
-    );
-    yield { type: 'error', reason: 'error', error };
+    ));
     return;
   }
 
@@ -188,54 +187,20 @@ async function* runStream(
       return ok(res);
     }, { onRetryAttempt: options.onRetryAttempt });
   } catch (e: any) {
-    const aborted = e?.name === 'AbortError' || options.signal?.aborted;
-    const error = createEmptyAssistantMessage();
-    error.model = model.id;
-    error.provider = model.provider;
-    error.stopReason = aborted ? 'aborted' : 'error';
-    if (aborted) {
-      error.errorMessage = 'Request aborted';
-    } else if (e?.status && typeof e.status === 'number') {
-      // 重试后仍失败的 HTTP 错误；消费 body 文本（避免连接泄漏 + 提供可读信息）
-      try {
-        const normalized = await normalizeResponseError(e);
-        error.errorMessage = formatHttpError(e.status, normalized.message, 'Anthropic API error');
-      } catch {
-        error.errorMessage = formatHttpError(
-          e.status,
-          e.statusText || `HTTP ${e.status}`,
-          'Anthropic API error',
-        );
-      }
-    } else {
-      // 网络错误 / 超时 / 其他：按 AgentError 分类或消息模式打前缀
-      const category = classifyError(e);
-      error.errorMessage = formatCategoryError(category, String(e?.message ?? e));
-    }
-    yield { type: 'error', reason: aborted ? 'aborted' : 'error', error };
+    // abort / HTTP（含被 retry 抛出的 Response）/ 网络错误统一归一化
+    yield await buildRequestErrorEvent(model, e, options.signal, 'Anthropic API error');
     return;
   }
 
   options.onResponse?.(response);
 
   if (!response.ok) {
-    const normalized = await normalizeResponseError(response);
-    const error = createEmptyAssistantMessage();
-    error.model = model.id;
-    error.provider = model.provider;
-    error.stopReason = 'error';
-    error.errorMessage = formatHttpError(response.status, normalized.message, 'Anthropic API error');
-    yield { type: 'error', reason: 'error', error };
+    yield await buildResponseErrorEvent(model, response, 'Anthropic API error');
     return;
   }
 
   if (!response.body) {
-    const error = createEmptyAssistantMessage();
-    error.model = model.id;
-    error.provider = model.provider;
-    error.stopReason = 'error';
-    error.errorMessage = 'Response has no body';
-    yield { type: 'error', reason: 'error', error };
+    yield createErrorEvent(model, 'Response has no body');
     return;
   }
 
@@ -265,49 +230,16 @@ async function* runStream(
 
   // 空闲超时：两次数据块之间超过 idleTimeoutMs 视为断流，避免半开连接永久挂起。
   // 总超时（timeoutMs）：整个流式响应从开始到结束的硬时限，与 idle 互补，
-  // 防止"持续有数据但整体超长"的挂起。取两者中更早到期者。
-  const idleTimeoutMs = options.idleTimeoutMs ?? 60_000;
-  const totalTimeoutMs = options.timeoutMs ?? 0;
-  const deadline = totalTimeoutMs > 0 ? Date.now() + totalTimeoutMs : Infinity;
-  const readWithIdleTimeout = async (): Promise<{ done: boolean; value: Uint8Array | undefined }> => {
-    const readPromise = reader.read();
-    if (!idleTimeoutMs || idleTimeoutMs <= 0) return readPromise;
-    let timer: NodeJS.Timeout | undefined;
-    // 总超时优先：剩余时间耗尽则立即失败，无需再等待 idle
-    const remaining = totalTimeoutMs > 0 ? deadline - Date.now() : Infinity;
-    if (remaining <= 0) {
-      throw new AgentError(
-        `Stream total timeout after ${totalTimeoutMs}ms`,
-        { category: AgentErrorCategory.TIMEOUT },
-      );
-    }
-    const waitMs = Math.min(idleTimeoutMs, remaining);
-    try {
-      return await Promise.race([
-        readPromise,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(
-            () => {
-              const isTotal = totalTimeoutMs > 0 && Date.now() >= deadline;
-              reject(new AgentError(
-                isTotal
-                  ? `Stream total timeout after ${totalTimeoutMs}ms`
-                  : `Stream idle timeout after ${idleTimeoutMs}ms`,
-                { category: AgentErrorCategory.TIMEOUT },
-              ));
-            },
-            waitMs,
-          );
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  };
+  // 防止"持续有数据但整体超长"的挂起。取两者中更早到期者（见 stream-shared）。
+  const readChunk = createTimeoutReader(
+    reader,
+    options.idleTimeoutMs ?? 60_000,
+    options.timeoutMs ?? 0,
+  );
 
   try {
     while (!streamDone) {
-      const { done, value } = await readWithIdleTimeout();
+      const { done, value } = await readChunk();
       if (done) {
         streamDone = true;
         break;
@@ -438,7 +370,7 @@ async function* runStream(
     partial.errorMessage = aborted
       ? 'Stream aborted'
       : formatCategoryError(classifyError(e), String(e?.message ?? e));
-    partial.usage = buildUsage(inputTokens, outputTokens, model, cacheReadTokens);
+    partial.usage = buildUsage(inputTokens, outputTokens, cacheReadTokens);
     partial.responseId = responseId;
     yield { type: 'error', reason: aborted ? 'aborted' : 'error', error: partial };
     return;
@@ -464,7 +396,7 @@ async function* runStream(
     : stopReason;
 
   partial.stopReason = mappedStopReason;
-  partial.usage = buildUsage(inputTokens, outputTokens, model, cacheReadTokens);
+  partial.usage = buildUsage(inputTokens, outputTokens, cacheReadTokens);
   partial.responseId = responseId;
 
   yield { type: 'done', reason: mappedStopReason, message: partial };
@@ -477,32 +409,5 @@ export function streamAnthropic(
   context: Context,
   options: SimpleStreamOptions = {},
 ): StreamResult {
-  let finalMessage: AssistantMessage = createEmptyAssistantMessage();
-  let generator: AsyncGenerator<StreamEvent> | null = null;
-
-  const getGenerator = (): AsyncGenerator<StreamEvent> => {
-    if (!generator) {
-      generator = runStream(model, context, options);
-    }
-    return generator;
-  };
-
-  const stream: StreamResult = {
-    [Symbol.asyncIterator]() {
-      return getGenerator();
-    },
-    async result(): Promise<AssistantMessage> {
-      const gen = getGenerator();
-      for await (const event of gen) {
-        if (event.type === 'done') {
-          finalMessage = event.message;
-        } else if (event.type === 'error') {
-          finalMessage = event.error;
-        }
-      }
-      return finalMessage;
-    },
-  };
-
-  return stream;
+  return createStreamResult(() => runStream(model, context, options));
 }

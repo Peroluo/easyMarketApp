@@ -284,7 +284,7 @@ export class ToolExecutor {
   }
 
   isErrorResult(result: ToolResult): boolean {
-    return !!(result.details && typeof result.details === 'object' && 'error' in result.details);
+    return toolResultStatus(result) === 'error';
   }
 
   /** beforeToolCall 阻断/终止时生成拒绝结果（非执行错误，isError=false） */
