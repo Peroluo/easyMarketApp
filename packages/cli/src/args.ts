@@ -124,6 +124,18 @@ export function parseArgs(args: string[]): Args {
     }
     const flag = shortWithValue[arg] ?? arg;
 
+    /**
+     * 吞并紧随的位置参数作为选项的内联消息/搜索词。
+     * 仅当下一项存在、不是 `--` 分隔符、不以 - / @ 开头时才吞并
+     * （否则会把后续选项或 @文件引用误当作消息）。
+     */
+    const nextPositional = (): string | undefined => {
+      const next = args[i + 1];
+      return next !== undefined && next !== '--' && !next.startsWith('-') && !next.startsWith('@')
+        ? (i++, next)
+        : undefined;
+    };
+
     if (arg === '--help' || arg === '-h') {
       result.help = true;
     } else if (arg === '--version' || arg === '-v') {
@@ -153,27 +165,13 @@ export function parseArgs(args: string[]): Args {
       }
     } else if (arg === '--print' || arg === '-p') {
       result.print = true;
-      // 内联值优先（--print=消息）；否则吞并紧随的非选项消息
-      const v = inlineValue ?? (() => {
-        const next = args[i + 1];
-        return next !== undefined && next !== '--' && !next.startsWith('@') && !next.startsWith('-')
-          ? (i++, next)
-          : undefined;
-      })();
+      // 内联值优先（--print=消息），否则吞并紧随的位置参数
+      const v = inlineValue ?? nextPositional();
       if (v !== undefined) result.messages.push(v);
     } else if (arg === '--list-models') {
-      // 内联值优先（--list-models=搜索词）
-      const v = inlineValue ?? (() => {
-        const next = args[i + 1];
-        return next !== undefined && next !== '--' && !next.startsWith('-') && !next.startsWith('@')
-          ? (i++, next)
-          : undefined;
-      })();
-      result.listModels = v ?? true;
+      result.listModels = inlineValue ?? nextPositional() ?? true;
     } else if (arg.startsWith('@')) {
       result.fileArgs.push(arg.slice(1));
-    } else if (arg.startsWith('--')) {
-      result.diagnostics.push({ type: 'error', message: `未知选项: ${arg}` });
     } else if (arg.startsWith('-') && arg !== '-') {
       result.diagnostics.push({ type: 'error', message: `未知选项: ${arg}` });
     } else {

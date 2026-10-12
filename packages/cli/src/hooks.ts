@@ -40,7 +40,7 @@ export interface HookDefinition {
    * 缺省匹配全部工具。
    */
   matcher?: string;
-  /** shell 命令（/bin/sh -c 执行；stdin 收到事件 JSON） */
+  /** shell 命令（经系统 shell 执行：Unix /bin/sh -c，Windows cmd /c；stdin 收到事件 JSON） */
   command: string;
   /** 超时毫秒数（默认 60000；超时 kill 并视为无决策） */
   timeoutMs?: number;
@@ -75,6 +75,14 @@ interface HookRunOutcome {
   stderr: string;
 }
 
+/** hook 命令 shell：Windows 用 ComSpec（Node 自动追加 /d /s /c），Unix 用 /bin/sh（-c） */
+function pickHookShell(): string {
+  if (process.platform === 'win32') {
+    return process.env.ComSpec ?? 'cmd.exe';
+  }
+  return '/bin/sh';
+}
+
 /** 执行单个 hook 命令：stdin 传 JSON，收集 stdout/stderr，超时 kill */
 function runHookCommand(
   hook: HookDefinition,
@@ -83,7 +91,10 @@ function runHookCommand(
   return new Promise(resolve => {
     let child;
     try {
-      child = spawn('/bin/sh', ['-c', hook.command], {
+      // shell 选项交给 Node 处理 cmd.exe 与 POSIX shell 的参数差异
+      // （此前硬编码 /bin/sh，Windows 上所有用户 hooks 静默失败）
+      child = spawn(hook.command, {
+        shell: pickHookShell(),
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, AIPACK_HOOK: '1' },
       });

@@ -27,7 +27,8 @@ export class ChunkRenderer {
   constructor(private opts: RenderOptions = {}) {}
 
   render(chunk: ResultChunk): void {
-    const err = this.opts.toolStream ?? process.stdout;
+    // 工具/状态信息输出流（默认 stdout；print 模式传 stderr 保持 stdout 纯文本）
+    const status = this.opts.toolStream ?? process.stdout;
     switch (chunk.type) {
       case 'text':
         // 流式文本输出前停止任何动画，避免行内交错
@@ -50,7 +51,7 @@ export class ChunkRenderer {
           if (process.stdout.isTTY) {
             this.spinner.start('思考中');
           } else {
-            err.write(chalk.dim('  (思考中...)\n'));
+            status.write(chalk.dim('  (思考中...)\n'));
           }
         }
         break;
@@ -63,7 +64,7 @@ export class ChunkRenderer {
         if (process.stdout.isTTY) {
           this.spinner.start(`执行 ${chunk.toolName ?? '工具'}`);
         } else {
-          err.write(chalk.cyan(`\n⚙ ${chunk.toolName} `));
+          status.write(chalk.cyan(`\n⚙ ${chunk.toolName} `));
         }
         break;
 
@@ -75,7 +76,7 @@ export class ChunkRenderer {
             const mark = chunk.isError ? chalk.red('✗') : chalk.green('✓');
             this.spinner.stop(`${chalk.cyan('⚙')} ${chunk.toolName ?? ''} ${mark}${timeStr}`);
           } else {
-            err.write(chunk.isError ? chalk.red(' ✗\n') : chalk.green(' ✓\n'));
+            status.write(chunk.isError ? chalk.red(' ✗\n') : chalk.green(' ✓\n'));
           }
           this.inTool = false;
           // 工具结束后常跟随新一段推理思考：复位以便再次显示提示
@@ -86,7 +87,7 @@ export class ChunkRenderer {
       case 'error':
         this.spinner.stop();
         this.inTool = false;
-        err.write(chalk.red(`\n错误: ${chunk.content ?? '未知错误'}\n`));
+        status.write(chalk.red(`\n错误: ${chunk.content ?? '未知错误'}\n`));
         break;
 
       case 'done':

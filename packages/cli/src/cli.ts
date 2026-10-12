@@ -128,22 +128,19 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   try {
-    if (args.mode === 'json') {
+    if (args.mode === 'json' || printMode) {
       const request = createRequest(initial.text || '(空)', {
         channel: 'cli',
         sessionKey: built.sessionKey,
         ephemeral: args.noSession,
         media: initial.media,
       });
-      await runJsonMode(built.runtime, request);
-    } else if (printMode) {
-      const request = createRequest(initial.text || '(空)', {
-        channel: 'cli',
-        sessionKey: built.sessionKey,
-        ephemeral: args.noSession,
-        media: initial.media,
-      });
-      await runPrintMode(built.runtime, request);
+      // --mode json 优先于 -p（选项冲突警告已在 parseArgs 给出）
+      if (args.mode === 'json') {
+        await runJsonMode(built.runtime, request);
+      } else {
+        await runPrintMode(built.runtime, request);
+      }
     } else {
       await runInteractiveMode({
         runtime: built.runtime,

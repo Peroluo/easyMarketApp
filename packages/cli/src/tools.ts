@@ -100,10 +100,14 @@ export const readTool: Tool = {
         const end = args.limit !== undefined ? start + args.limit : lines.length;
         content = lines.slice(start, end).join('\n');
       }
+      // 截断标志在截断时显式置位（此前用 content.length >= 上限反推：
+      // 恰好等于上限的未截断文件会被误标 truncated）
+      let truncated = false;
       if (content.length > MAX_READ_CHARS) {
         content = content.slice(0, MAX_READ_CHARS) + `\n...[截断，共 ${content.length} 字符]`;
+        truncated = true;
       }
-      return textResult(content, { file: args.file, truncated: content.length >= MAX_READ_CHARS });
+      return textResult(content, { file: args.file, truncated });
     } catch (err) {
       return errorResult(String(err instanceof Error ? err.message : err));
     }
@@ -359,8 +363,9 @@ function globToRegExp(pattern: string): RegExp {
 async function walkFiles(root: string, maxEntries: number): Promise<string[]> {
   const out: string[] = [];
   const queue: string[] = [''];
-  while (queue.length > 0 && out.length < maxEntries) {
-    const rel = queue.shift()!;
+  // 索引推进代替 shift()：shift 为 O(n) 出队，大目录遍历退化为 O(n²)
+  for (let qi = 0; qi < queue.length && out.length < maxEntries; qi++) {
+    const rel = queue[qi];
     const abs = path.join(root, rel);
     let entries;
     try {
@@ -485,13 +490,13 @@ export const grepTool: Tool = {
         if (buf.includes(0)) continue; // 二进制文件
         const lines = buf.toString('utf8').split('\n');
 
-        // 收集本文件匹配行号
-        const hitLines: number[] = [];
-        for (let i = 0; i < lines.length && matchCount + hitLines.length < limit; i++) {
-          if (re.test(lines[i])) hitLines.push(i);
+        // 收集本文件匹配行号（Set：marker 判定 O(1)，避免 includes 的 O(n²)）
+        const hitLines = new Set<number>();
+        for (let i = 0; i < lines.length && matchCount + hitLines.size < limit; i++) {
+          if (re.test(lines[i])) hitLines.add(i);
         }
-        if (hitLines.length === 0) continue;
-        matchCount += hitLines.length;
+        if (hitLines.size === 0) continue;
+        matchCount += hitLines.size;
 
         // 带去重的行号区间（context 展开）
         const show = new Set<number>();
@@ -501,7 +506,7 @@ export const grepTool: Tool = {
           }
         }
         for (const i of [...show].sort((a, b) => a - b)) {
-          const marker = hitLines.includes(i) ? '>' : ' ';
+          const marker = hitLines.has(i) ? '>' : ' ';
           out.push(`${file.rel}:${i + 1}:${marker} ${lines[i].slice(0, 500)}`);
         }
       }
