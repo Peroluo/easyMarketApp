@@ -203,7 +203,7 @@ test('transformer: 巨型 tool result 由 trim 按 token 裁剪（请求路径�
 
   const out = await transformer.transform([a1, big, ...tail], makeCtx('trim-only', 1));
   const trimmed = (out.find(r => r.id === 'tr1')!.content as { text: string }[])[0];
-  assert.ok(trimmed.text.includes('truncated'), 'trim 应裁剪');
+  assert.ok(trimmed.text.includes('已截断'), 'trim 应裁剪');
   assert.equal(calls.length, 0, 'trim 达标不应有 fork');
 });
 

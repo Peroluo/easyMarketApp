@@ -31,7 +31,7 @@ const STATUS_COLOR: Record<AgentDefinitionItem['status'], string> = {
 };
 
 const DEFAULT_SPEC: AgentSpec = {
-  systemPrompt: 'You are a helpful assistant.',
+  systemPrompt: '你是一个乐于助人的助手。',
   model: { provider: 'openai', id: 'gpt-4o', temperature: 0.7 },
   tools: [],
   params: { maxTurns: 10 },

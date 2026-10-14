@@ -48,18 +48,18 @@ export type ContextExhaustedHandler = (event: ContextExhaustedEvent) => void | P
 
 // ─── 交接文档生成 ─────────────────────────────────────────────────
 
-const HANDOFF_PROMPT = `You are a session handoff agent.
-A previous agent session has exhausted its context window after compression attempts.
-Generate a concise handoff document that allows a fresh session to continue the task seamlessly.
+const HANDOFF_PROMPT = `你是一个会话交接代理。
+前一个代理会话在多次压缩尝试后已耗尽上下文窗口。
+请生成一份简洁的交接文档，让全新会话能够无缝继续该任务。
 
-The handoff document MUST include:
-1. **Original Task**: What the user originally asked for
-2. **What Was Done**: Summary of completed work and key results
-3. **Current State**: Where the task currently stands
-4. **What Remains**: Specific next steps to complete the task
-5. **Critical Context**: Constraints, decisions, or facts that must be preserved
+交接文档必须包含：
+1. **原始任务**：用户最初的要求
+2. **已完成工作**：已完成工作与关键结果的摘要
+3. **当前状态**：任务当前的进展位置
+4. **待办事项**：完成任务所需的具体后续步骤
+5. **关键上下文**：必须保留的约束、决策或事实
 
-Be concise but complete. The new session will have NO other context besides this document.`;
+保持简洁但完整。新会话除了这份文档外没有任何其他上下文。`;
 
 /**
  * 生成交接文档（fork 优先，失败则确定性 fallback）。
@@ -88,7 +88,7 @@ export async function generateHandoffDocument(opts: {
   if (config.lifecycle.enabled) {
     const out = await fork.runText(safety, {
       systemPrompt: HANDOFF_PROMPT,
-      userPrompt: `Generate a handoff document for:\n\n${contextText}`,
+      userPrompt: `请为以下上下文生成交接文档：\n\n${contextText}`,
       sessionKey,
       turn,
       label: 'lifecycle_handoff',
@@ -148,12 +148,12 @@ function collectContext(resources: ContextResource[]): string {
 
   const summaries = resources.filter(r => r.type === 'compaction_summary');
   if (summaries.length > 0) {
-    parts.push(`## Previous Summaries\n${summaries.map(r => resourceText(r)).join('\n\n')}`);
+    parts.push(`## 历史摘要\n${summaries.map(r => resourceText(r)).join('\n\n')}`);
   }
 
   const recent = resources.slice(-6);
   if (recent.length > 0) {
-    parts.push(`## Recent Context\n${recent.map(r => `[${r.type}] ${resourceText(r)}`).join('\n\n')}`);
+    parts.push(`## 最近上下文\n${recent.map(r => `[${r.type}] ${resourceText(r)}`).join('\n\n')}`);
   }
 
   return parts.join('\n\n---\n\n');
@@ -166,21 +166,21 @@ function fallbackHandoff(resources: ContextResource[]): string {
   const summaries = resources.filter(r => r.type === 'compaction_summary');
 
   const lines = [
-    '## Session Handoff (fallback)',
+    '## 会话交接（fallback）',
     '',
-    `Original request: ${firstUser ? resourceText(firstUser).slice(0, 500) : 'Unknown'}`,
+    `原始请求：${firstUser ? resourceText(firstUser).slice(0, 500) : '未知'}`,
     '',
   ];
   if (summaries.length > 0) {
-    lines.push('Previous summaries:');
+    lines.push('历史摘要：');
     for (const s of summaries) {
       lines.push(`- ${resourceText(s).slice(0, 400)}`);
     }
     lines.push('');
   }
   if (lastUser && lastUser !== firstUser) {
-    lines.push(`Latest user message: ${resourceText(lastUser).slice(0, 500)}`, '');
+    lines.push(`最近用户消息：${resourceText(lastUser).slice(0, 500)}`, '');
   }
-  lines.push('Please continue from where the previous session left off.');
+  lines.push('请从前一个会话中断处继续。');
   return lines.join('\n');
 }

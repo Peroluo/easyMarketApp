@@ -64,9 +64,9 @@ export function formatSkillsSection(skills: Skill[]): string {
     .join('\n');
 
   return [
-    'The following skills provide specialized instructions for specific tasks.',
-    'Use the skill tool to load a skill when the task matches its description.',
-    'When a skill references relative paths, resolve them against its baseDir.',
+    '以下 skills 针对特定任务提供专门的指令说明。',
+    '当任务与某个 skill 的描述匹配时，使用 skill 工具加载该 skill。',
+    '当 skill 中引用了相对路径时，请基于其 baseDir 进行解析。',
     '',
     '<available_skills>',
     entries,
@@ -101,8 +101,8 @@ export function createSkillTool(
   return {
     name: options?.name ?? 'skill',
     description:
-      'Load the full instructions of a skill by name. ' +
-      'Use when the task matches a skill listed in <available_skills>.',
+      '按名称加载某个 skill 的完整指令内容。' +
+      '当任务与 <available_skills> 中列出的某个 skill 匹配时使用。',
     parameters: {
       type: 'object',
       properties: {
@@ -131,7 +131,7 @@ export function createSkillTool(
       }
       const parts = [skill.content];
       if (skill.baseDir) {
-        parts.push(`References are relative to: ${skill.baseDir}`);
+        parts.push(`引用路径相对于：${skill.baseDir}`);
       }
       return {
         content: [createTextContent(parts.join('\n\n'))],

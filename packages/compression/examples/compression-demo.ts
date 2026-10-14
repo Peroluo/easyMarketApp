@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   // summarize 把历史 + 裁剪后的 tool_result 替换为单条摘要。
   const longOutput = Array.from({ length: 800 }, (_, i) => `line ${i}: data`).join('\n');
   const resources: ContextResource[] = [
-    makeResource('sys1', 'system_message', 'You are a helpful assistant.', [], true),
+    makeResource('sys1', 'system_message', '你是一个乐于助人的助手。', [], true),
     makeResource('u1', 'user_message', 'x'.repeat(320)),
     makeResource('u2', 'user_message', 'x'.repeat(320)),
     makeResource('u3', 'user_message', 'x'.repeat(320)),

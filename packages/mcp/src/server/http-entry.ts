@@ -49,10 +49,10 @@ async function loadToolsFromEnv(): Promise<Tool[] | null> {
 
 const echoTool: Tool = {
   name: 'echo',
-  description: 'Echo back the input text',
+  description: '原样返回输入文本',
   parameters: {
     type: 'object',
-    properties: { text: { type: 'string', description: 'text to echo' } },
+    properties: { text: { type: 'string', description: '要回显的文本' } },
     required: ['text'],
   },
   permissions: [],
@@ -64,7 +64,7 @@ const echoTool: Tool = {
 
 const addTool: Tool = {
   name: 'add',
-  description: 'Add two numbers',
+  description: '两数相加',
   parameters: {
     type: 'object',
     properties: { a: { type: 'number' }, b: { type: 'number' } },
@@ -85,10 +85,10 @@ const addTool: Tool = {
 function buildAskLlmTool(hostGetter: () => McpServerHost): Tool {
   return {
     name: 'ask_llm',
-    description: 'Ask the connected client LLM a question via MCP sampling',
+    description: '通过 MCP sampling 向已连接的客户端 LLM 提问',
     parameters: {
       type: 'object',
-      properties: { question: { type: 'string', description: 'question to ask' } },
+      properties: { question: { type: 'string', description: '要提问的问题' } },
       required: ['question'],
     },
     permissions: [],
@@ -99,12 +99,12 @@ function buildAskLlmTool(hostGetter: () => McpServerHost): Tool {
           messages: [{ role: 'user', content: { type: 'text', text: question } }],
           maxTokens: 256,
         });
-        const text = res.content.type === 'text' ? (res.content.text ?? '') : '[image response]';
+        const text = res.content.type === 'text' ? (res.content.text ?? '') : '[图像响应]';
         return { content: [{ type: 'text' as const, text }], details: undefined };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: 'text' as const, text: `sampling failed: ${message}` }],
+          content: [{ type: 'text' as const, text: `sampling 失败：${message}` }],
           details: { error: message },
         };
       }

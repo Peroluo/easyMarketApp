@@ -143,7 +143,7 @@ test('trim: 单行巨型 tool result（minified JSON）被按 token 裁剪（v1 
 
   const trimmed = result.resources.find(r => r.id === 'tr1')!;
   const text = (trimmed.content as ContentBlock[])[0] as { type: string; text: string };
-  assert.ok(text.text.includes('truncated'), '应含截断标记');
+  assert.ok(text.text.includes('已截断'), '应含截断标记');
   assert.ok(ctx.meter.estimateText(text.text) <= 100, `裁剪后应 <= 100 token，实际 ${ctx.meter.estimateText(text.text)}`);
   assert.ok(result.telemetry[0].afterTokens < result.telemetry[0].beforeTokens);
 });
@@ -167,7 +167,7 @@ test('trim: 多行 tool result 保留 head/tail 与关键 error 行', async () =
   assert.ok(text.includes('line 0'), '保留头');
   assert.ok(text.includes('line 299'), '保留尾');
   assert.ok(text.includes('ERROR: something failed'), '保留关键行');
-  assert.ok(text.includes('truncated 295 lines'), '含省略标记');
+  assert.ok(text.includes('已截断 295 行'), '含省略标记');
 });
 
 test('trim: tail-first 扫描 + 释放够即停 → 前缀资源原引用保留（KV cache 友好）', async () => {

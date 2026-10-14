@@ -27,21 +27,21 @@ import type { Tool } from '@aipack-ai/agent';
 const tools: Tool[] = [
   {
     name: 'greet',
-    description: 'Greet someone by name',
+    description: '按姓名向对方打招呼',
     parameters: {
       type: 'object',
-      properties: { name: { type: 'string', description: 'who to greet' } },
+      properties: { name: { type: 'string', description: '要问候的对象' } },
       required: ['name'],
     },
     permissions: [],
     async execute(_id, args) {
       const name = String((args as { name?: string } | null)?.name ?? 'world');
-      return { content: [{ type: 'text' as const, text: `hello ${name}` }], details: undefined };
+      return { content: [{ type: 'text' as const, text: `你好 ${name}` }], details: undefined };
     },
   },
   {
     name: 'add',
-    description: 'Add two numbers',
+    description: '两数相加',
     parameters: {
       type: 'object',
       properties: { a: { type: 'number' }, b: { type: 'number' } },
@@ -61,7 +61,7 @@ const host = createMcpServerHost({
   version: '0.1.0',
   tools,
   // 演示：可选 resources / prompts（提供即 advertise capability）
-  resources: [{ uri: 'about://aipack', name: 'about', description: 'about this server', text: 'aipack MCP example server', mimeType: 'text/plain' }],
+  resources: [{ uri: 'about://aipack', name: 'about', description: '关于本服务', text: 'aipack MCP 示例服务', mimeType: 'text/plain' }],
 });
 
 await runStdioServer(host);

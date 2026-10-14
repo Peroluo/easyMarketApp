@@ -127,7 +127,7 @@ export class TrimStrategy implements CompressionStrategy {
       const omitted = lines.length - head.length - tail.length;
       truncated = [
         ...head,
-        `[... truncated ${omitted} lines ...]`,
+        `[... 已截断 ${omitted} 行 ...]`,
         ...keyLines,
         ...tail,
       ].join('\n');
@@ -160,13 +160,13 @@ export class TrimStrategy implements CompressionStrategy {
     for (let i = 0; i < MAX_TRUNCATE_ITERATIONS && headChars > 0; i++) {
       const head = text.slice(0, headChars);
       const tail = text.slice(-TAIL_CHARS);
-      const candidate = `${head}\n[... truncated ${text.length - headChars - TAIL_CHARS} chars ...]\n${tail}`;
+      const candidate = `${head}\n[... 已截断 ${text.length - headChars - TAIL_CHARS} 字符 ...]\n${tail}`;
       if (ctx.meter.estimateText(candidate) <= maxTokens) {
         return candidate;
       }
       headChars = Math.floor(headChars * 0.8);
     }
-    return text.slice(0, Math.max(64, headChars)) + '\n[... truncated ...]';
+    return text.slice(0, Math.max(64, headChars)) + '\n[... 已截断 ...]';
   }
 
   /**

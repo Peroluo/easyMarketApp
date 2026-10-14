@@ -27,33 +27,32 @@ import type { CompressionTelemetry } from '../telemetry';
 import { createTelemetry } from '../telemetry';
 import type { ForkTextResult } from '../fork';
 
-const MAP_PROMPT = `You are a context compression agent.
-Summarize the following portion of a conversation history into a dense, factual summary.
-Preserve: user intent, key decisions, tool names and their outcomes, errors encountered,
-and any unresolved questions. Be concise. Output only the summary text.`;
+const MAP_PROMPT = `你是一个上下文压缩代理。
+请将下面这段对话历史压缩为一份信息密度高、忠实于事实的摘要。
+必须保留：用户意图、关键决策、工具名称及其结果、遇到的错误，
+以及所有未解决的问题。保持简洁。仅输出摘要文本本身。`;
 
-const FINAL_PROMPT = `You are a context compression agent.
-Summarize the conversation history into a concise, structured summary.
-Preserve all critical information for continued task execution.
+const FINAL_PROMPT = `你是一个上下文压缩代理。
+请将对话历史压缩为一份简洁、结构化的摘要。
+保留继续执行任务所需的全部关键信息。
 
-Output format:
+输出格式：
 
-## Context Summary
-[Core user intent and current task state]
+## 上下文摘要
+[核心用户意图与当前任务状态]
 
-## Key Decisions
-- [Decision 1]
+## 关键决策
+- [决策 1]
 
-## Tool Results
-- [Tool name]: [Key result/outcome]
+## 工具结果
+- [工具名称]：[关键结果/结论]
 
-## Pending Actions
-- [Action 1]`;
+## 待办事项
+- [待办 1]`;
 
 const REDUCE_PROMPT = `${FINAL_PROMPT}
 
-The history was previously summarized in separate portions. Merge the following partial
-summaries into one final summary (do not lose information):`;
+对话历史此前已被分段摘要。请将以下各段部分摘要合并为一份最终摘要（不得丢失信息）：`;
 
 export class SummarizeStrategy implements CompressionStrategy {
   readonly name = 'summarize' as const;
@@ -241,7 +240,7 @@ export class SummarizeStrategy implements CompressionStrategy {
       const systemPrompt = reSummarizePinned ? REDUCE_PROMPT : FINAL_PROMPT;
       return ctx.fork.runText(ctx.safety, {
         systemPrompt,
-        userPrompt: `Summarize the following conversation history:\n\n${transcript}`,
+        userPrompt: `请对以下对话历史进行摘要：\n\n${transcript}`,
         sessionKey: ctx.sessionKey,
         turn: ctx.turn,
         label: 'summarize',
@@ -255,7 +254,7 @@ export class SummarizeStrategy implements CompressionStrategy {
       // 单块仍超（单资源就超预算）：交给 fork 模型尽力而为（其自身会截断输入）
       return ctx.fork.runText(ctx.safety, {
         systemPrompt: FINAL_PROMPT,
-        userPrompt: `Summarize the following conversation history:\n\n${transcript}`,
+        userPrompt: `请对以下对话历史进行摘要：\n\n${transcript}`,
         sessionKey: ctx.sessionKey,
         turn: ctx.turn,
         label: 'summarize',
@@ -269,7 +268,7 @@ export class SummarizeStrategy implements CompressionStrategy {
     for (let i = 0; i < chunks.length; i++) {
       const out = await ctx.fork.runText(ctx.safety, {
         systemPrompt: MAP_PROMPT,
-        userPrompt: `Summarize the following portion (${i + 1}/${chunks.length}):\n\n${chunks[i]}`,
+        userPrompt: `请对以下第 ${i + 1}/${chunks.length} 部分对话历史进行摘要：\n\n${chunks[i]}`,
         sessionKey: ctx.sessionKey,
         turn: ctx.turn,
         label: `summarize_map_${i}`,
@@ -283,7 +282,7 @@ export class SummarizeStrategy implements CompressionStrategy {
     // reduce：合并部分摘要为最终摘要
     const reduced = await ctx.fork.runText(ctx.safety, {
       systemPrompt: REDUCE_PROMPT,
-      userPrompt: partialSummaries.map((s, i) => `## Portion ${i + 1}\n${s}`).join('\n\n'),
+      userPrompt: partialSummaries.map((s, i) => `## 第 ${i + 1} 部分\n${s}`).join('\n\n'),
       sessionKey: ctx.sessionKey,
       turn: ctx.turn,
       label: 'summarize_reduce',

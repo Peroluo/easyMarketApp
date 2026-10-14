@@ -238,7 +238,7 @@ function detectCompressionArtifacts(messages: any[]): string[] {
       : typeof c === 'string' ? c
       : Array.isArray(c) ? c.map((b: any) => b?.text ?? '').join('')
       : '';
-    return text.includes('[... truncated');
+    return text.includes('[... 已截断');
   });
   if (hasTrimmed) markers.push('Trim');
   if (hasSummary) markers.push('Summarize');
