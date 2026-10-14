@@ -215,6 +215,22 @@ const multiAgentMenu: MenuItem[] = [
   { key: '/multi-agent#result', label: '10. 运行结果', icon: <ApiOutlined /> },
 ];
 
+const compressionMenu: MenuItem[] = [
+  { key: '/compression#overview', label: '总览', icon: <RocketOutlined /> },
+  { key: '/compression#quickstart', label: '1. 快速开始', icon: <ThunderboltOutlined /> },
+  { key: '/compression#budget', label: '2. 预算模型与双水位', icon: <AimOutlined /> },
+  { key: '/compression#pipeline', label: '3. 策略管道总览', icon: <ForkOutlined /> },
+  { key: '/compression#trim', label: '4. Trim 无损裁剪', icon: <CodeOutlined /> },
+  { key: '/compression#summarize', label: '5. Summarize 有损摘要', icon: <ExperimentOutlined /> },
+  { key: '/compression#truncate', label: '6. Truncate 硬截断保底', icon: <SafetyCertificateOutlined /> },
+  { key: '/compression#precompress', label: '7. 异步预压缩', icon: <CloudUploadOutlined /> },
+  { key: '/compression#lifecycle', label: '8. 上下文耗尽事件', icon: <ApiOutlined /> },
+  { key: '/compression#telemetry', label: '9. 遥测与观测', icon: <LineChartOutlined /> },
+  { key: '/compression#config', label: '10. 配置全览', icon: <SettingOutlined /> },
+  { key: '/compression#env', label: '11. 环境变量', icon: <DatabaseOutlined /> },
+  { key: '/compression#when', label: '12. 适用场景与调参', icon: <DashboardOutlined /> },
+];
+
 const evalMenu: MenuItem[] = [
   { key: '/eval#overview', label: '总览', icon: <RocketOutlined /> },
   { key: '/eval#quickstart', label: '1. 快速开始', icon: <ThunderboltOutlined /> },
@@ -242,15 +258,15 @@ const examplesMenu: MenuItem[] = [
 const packagesMenu: MenuItem[] = [
   { key: '/packages', label: '包概览', icon: <AppstoreOutlined /> },
   { key: '/packages#aipack', label: 'aipack（核心）', icon: <RocketOutlined /> },
-  { key: '/packages#memory', label: 'aipack-memory', icon: <DatabaseOutlined /> },
+  { key: '/packages#aipack-memory', label: 'aipack-memory', icon: <DatabaseOutlined /> },
   { key: '/packages#aipack-skills', label: 'aipack-skills', icon: <TagsOutlined /> },
-  { key: '/packages#compression', label: 'aipack-compression', icon: <AimOutlined /> },
+  { key: '/packages#aipack-compression', label: 'aipack-compression', icon: <AimOutlined /> },
   { key: '/packages#aipack-multi-agent', label: 'aipack-multi-agent', icon: <ApartmentOutlined /> },
   { key: '/packages#aipack-mcp', label: 'aipack-mcp', icon: <DeploymentUnitOutlined /> },
   { key: '/packages#aipack-eval', label: 'aipack-eval', icon: <ExperimentOutlined /> },
   { key: '/packages#aipack-observability', label: 'aipack-observability', icon: <LineChartOutlined /> },
   { key: '/packages#aipack-observability-server', label: 'aipack-observability-server', icon: <CloudServerOutlined /> },
-  { key: '/packages#cli', label: 'aipack-cli', icon: <SettingOutlined /> },
+  { key: '/packages#aipack-cli', label: 'aipack-cli', icon: <SettingOutlined /> },
 ];
 
 export default function DocsLayout({ children }: DocsLayoutProps) {
@@ -277,6 +293,7 @@ export default function DocsLayout({ children }: DocsLayoutProps) {
     else if (path === '/mcp' || path.startsWith('/mcp')) items = mcpMenu;
     else if (path === '/eval' || path.startsWith('/eval')) items = evalMenu;
     else if (path === '/multi-agent' || path.startsWith('/multi-agent')) items = multiAgentMenu;
+    else if (path === '/compression' || path.startsWith('/compression')) items = compressionMenu;
     else if (path === '/examples' || path.startsWith('/examples')) items = examplesMenu;
     else if (path === '/packages' || path.startsWith('/packages')) items = packagesMenu;
     const selected = location.pathname + (location.hash || '');
@@ -303,6 +320,7 @@ export default function DocsLayout({ children }: DocsLayoutProps) {
     if (rootPath === '/mcp') return mcpMenu;
     if (rootPath === '/eval') return evalMenu;
     if (rootPath === '/multi-agent') return multiAgentMenu;
+    if (rootPath === '/compression') return compressionMenu;
     if (rootPath === '/examples') return examplesMenu;
     if (rootPath === '/packages') return packagesMenu;
     return [];

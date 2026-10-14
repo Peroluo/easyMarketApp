@@ -15,6 +15,7 @@ import {
   DeploymentUnitOutlined,
   ExperimentOutlined,
   ToolOutlined,
+  AimOutlined,
   DownOutlined,
 } from '@ant-design/icons';
 import { useIsMobile } from '../hooks/useIsMobile';
@@ -26,6 +27,7 @@ const navItems = [
   { path: '/cli', label: 'CLI 工具', icon: <ToolOutlined /> },
   { path: '/api', label: 'API 文档', icon: <BookOutlined /> },
   { path: '/extend', label: '扩展指南', icon: <CodeOutlined /> },
+  { path: '/compression', label: '上下文压缩', icon: <AimOutlined /> },
   { path: '/observability', label: '可观测性', icon: <LineChartOutlined /> },
   { path: '/memory', label: '持久化记忆', icon: <DatabaseOutlined /> },
   { path: '/skills', label: 'Agent Skills', icon: <TagsOutlined /> },
@@ -50,6 +52,12 @@ export default function Navbar() {
   const [menuOpen, setMenuOpen] = useState(false);
   const currentPath = location.pathname;
 
+  // 命中当前路由：带 hash 的直达项需路径 + hash 完全匹配
+  const isItemActive = (path: string) => {
+    if (path.includes('#')) return `${currentPath}${location.hash}` === path;
+    return path === '/' ? currentPath === '/' : currentPath.startsWith(path);
+  };
+
   // 路由变化（含浏览器前进/后退）时收起抽屉
   useEffect(() => {
     setMenuOpen(false);
@@ -63,8 +71,7 @@ export default function Navbar() {
   const renderNavList = () => (
     <div className="mobile-nav-list">
       {navItems.map((item) => {
-        const isActive =
-          item.path === '/' ? currentPath === '/' : currentPath.startsWith(item.path);
+        const isActive = isItemActive(item.path);
         return (
           <div
             key={item.path}
@@ -114,8 +121,7 @@ export default function Navbar() {
       {!isMobile && (
         <div className="navbar-links">
           {primaryNavItems.map((item) => {
-            const isActive =
-              item.path === '/' ? currentPath === '/' : currentPath.startsWith(item.path);
+            const isActive = isItemActive(item.path);
             return (
               <span
                 key={item.path}

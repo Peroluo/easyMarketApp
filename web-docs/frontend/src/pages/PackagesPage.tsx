@@ -1,3 +1,5 @@
+import { useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 import { Card, Row, Col, Tag, List, Divider, Typography } from 'antd';
 import {
   RocketOutlined,
@@ -111,6 +113,28 @@ function PackageCard({ pkg }: { pkg: PackageInfo }) {
 }
 
 export default function PackagesPage() {
+  const location = useLocation();
+
+  // 支持从导航直达某个包卡片（#<package-id>）
+  useEffect(() => {
+    const id = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+    if (!id) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+    const tryScroll = () => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return true;
+      }
+      return false;
+    };
+    if (!tryScroll()) {
+      setTimeout(tryScroll, 50);
+    }
+  }, [location.hash]);
+
   return (
     <div>
       <div id="overview" style={{ marginBottom: 32 }}>
