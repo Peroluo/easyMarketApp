@@ -168,7 +168,7 @@ export default function QuickstartPage() {
         <p style={{ lineHeight: 1.8, color: '#475569' }}>
           不想写代码？直接安装 <code>@aipack-ai/cli</code>，在终端获得一个带内置工具的 AI 编程助手：
           交互 REPL、管道单次提问、JSON 事件流三种模式，内置 find / grep / ls / task（子 agent）
-          等工具，支持项目记忆文件（AIPACK.md）、Skills、MCP、Hooks 与五级上下文压缩。
+          等工具，支持项目记忆文件（AIPACK.md）、Skills、MCP、Hooks 与策略管道上下文压缩。
         </p>
         <CodeBlock code={qsCliQuickstartCode} language="bash" />
         <p style={{ lineHeight: 1.8, color: '#475569', marginTop: 16 }}>

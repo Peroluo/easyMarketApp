@@ -1,12 +1,12 @@
 /**
- * aipack-compression -- aipack 多级上下文压缩
+ * aipack-compression -- aipack 上下文压缩（v2 策略管道架构）
  *
- * 五级渐进式降级：
- *   L1: ToolOutputTrim       工具输出裁剪（无损，缓存安全）
- *   L2: MessageSummarize     旧消息摘要（有损，Fork Agent）
- *   L3: TaskStateExtraction  任务状态提取（结构化降级）
- *   L4: SessionCheckpoint     会话检查点（持久化 + 激进缩减）
- *   L5: NewSessionHandoff    新会话交接（保底重置）
+ * 设计要点：
+ *   - 统一预算：所有决策基于 effectiveBudget（contextWindow - 输出预留 - 安全边距）
+ *   - 双水位：precompress(0.70) → trigger(0.80) → target(0.40)，一次压到位摊薄多轮
+ *   - 策略管道：trim（无损裁剪）→ summarize（有损摘要，map-reduce）→ truncate（保底）
+ *   - 预压缩：低预警线后台 fork 摘要，高水位直接应用，请求路径零 fork
+ *   - 生命周期：压不下去时发 ContextExhaustedEvent，检查点/换会话由 host 决策
  *
  * 快速接入：
  *   import { createCompressionTransformer, loadCompressionConfig } from '@aipack-ai/compression';
@@ -19,9 +19,9 @@
  *   // 加入 createRuntime 的 transformers 数组（按数组顺序链式执行）
  *   transformers: [transformer],
  *
- *   // 可选：注入 handoff 钩子，让 L5 真正切换会话
- *   transformer.setHandoffHook(({ handoff }) => {
- *     runtime.switchSession(handoff.newSessionId);
+ *   // 可选：上下文耗尽时（pinned/保护区本身超限）接管检查点/换会话
+ *   transformer.onContextExhausted(({ handoffDocument, suggestedSessionId }) => {
+ *     runtime.switchSession(suggestedSessionId);
  *   });
  */
 
@@ -36,16 +36,43 @@ export type { CompressionTransformerOptions } from './src/compression-transforme
 export {
   loadCompressionConfig,
   validateConfig,
-  DEFAULT_DROP_ORDER,
 } from './src/config';
 export type { CompressionConfig, DeepPartial, ConfigValidationError } from './src/config';
 
-// ─── Token 估算 ───────────────────────────────────────────────────
+// ─── 预算 ─────────────────────────────────────────────────────────
+export { ContextBudget } from './src/budget';
+export type { BudgetConfig } from './src/budget';
+
+// ─── Token 计量 ───────────────────────────────────────────────────
 export {
-  CharHeuristicEstimator,
+  TokenMeter,
   createTokenEstimator,
 } from './src/token-estimator';
-export type { TokenEstimator, TokenizerLike, EstimationSnapshot } from './src/token-estimator';
+export type { TokenEstimator, TokenizerLike } from './src/token-estimator';
+
+// ─── Fork 执行器 ──────────────────────────────────────────────────
+export { ForkRunner } from './src/fork';
+export type { ForkRunnerOptions, ForkTextCall, ForkTextResult } from './src/fork';
+
+// ─── 策略管道 ─────────────────────────────────────────────────────
+export type {
+  CompressionStrategy,
+  StrategyContext,
+  StrategyResult,
+  PrecomputedSummary,
+} from './src/strategy';
+export { resourceText, formatResourceForTranscript } from './src/strategy';
+export { TrimStrategy } from './src/strategies/trim';
+export { SummarizeStrategy } from './src/strategies/summarize';
+export { TruncateStrategy } from './src/strategies/truncate';
+
+// ─── 会话生命周期 ─────────────────────────────────────────────────
+export type {
+  ContextExhaustedEvent,
+  ContextExhaustedHandler,
+  ExhaustedReason,
+} from './src/lifecycle';
+export { generateHandoffDocument } from './src/lifecycle';
 
 // ─── 安全机制 ─────────────────────────────────────────────────────
 export {
@@ -88,29 +115,10 @@ export {
 } from './src/telemetry';
 export type {
   CompressionTelemetry,
+  CompressionStage,
   TelemetryReporter,
   ConsoleReporterOptions,
 } from './src/telemetry';
-
-// ─── L1: 工具输出裁剪 ─────────────────────────────────────────────
-export { ToolOutputTrim } from './src/l1-tool-output-trim';
-export type { L1Config, CompressResult } from './src/l1-tool-output-trim';
-
-// ─── L2: 旧消息摘要 ───────────────────────────────────────────────
-export { MessageSummarize } from './src/l2-message-summarize';
-export type { L2Config } from './src/l2-message-summarize';
-
-// ─── L3: 任务状态提取 ─────────────────────────────────────────────
-export { TaskStateExtraction, findTaskState } from './src/l3-task-state-extraction';
-export type { L3Config, TaskState } from './src/l3-task-state-extraction';
-
-// ─── L4: 会话检查点 ───────────────────────────────────────────────
-export { SessionCheckpointLevel } from './src/l4-session-checkpoint';
-export type { L4Config, SessionCheckpoint } from './src/l4-session-checkpoint';
-
-// ─── L5: 新会话交接 ───────────────────────────────────────────────
-export { NewSessionHandoff } from './src/l5-new-session-handoff';
-export type { L5Config, SessionHandoff, HandoffHook, HandoffHookContext } from './src/l5-new-session-handoff';
 
 // ─── 从 aipack 再导出常用类型 ──────────────────────────────────
 export type {
@@ -120,6 +128,5 @@ export type {
   Extension,
   Model,
   StreamFn,
-  SessionStorage,
 } from '@aipack-ai/agent';
 export { BaseTransformer } from '@aipack-ai/agent';

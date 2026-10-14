@@ -1,23 +1,23 @@
 /**
- * ContextCompressionTransformer 集成测试 - 覆盖关键修复点
- *  - contextWindow 防御性校验
- *  - 熔断器在 maxAttempts 后触发
- *  - 遥测通过 reporter 上报
- *  - 遥测通过 sharedMap 写入
- *  - setHandoffHook 真正被调用
- *  - recover API 可用
+ * ContextCompressionTransformer 集成测试
+ *
+ * 覆盖：双水位调度、策略编排、真互斥、后台预压缩、dryRun、
+ *       耗尽事件、遥测上报、配置校验
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ContextResource, Model, StreamFn, StreamResult, SessionStorage, StoredSession } from '@aipack-ai/agent';
+import type { ContextResource, Model, StreamFn, AssistantMessage } from '@aipack-ai/agent';
 import {
   createCompressionTransformer,
   loadCompressionConfig,
-  ConsoleTelemetryReporter,
+  validateConfig,
   TELEMETRY_SHARED_KEY,
 } from '../index';
-import type { CompressionTelemetry } from '../index';
+import type { CompressionTelemetry, ContextExhaustedEvent } from '../index';
+import type { TransformContext } from '@aipack-ai/agent';
+
+// ─── 工具 ─────────────────────────────────────────────────────────
 
 function makeResource(
   id: string,
@@ -35,10 +35,17 @@ function makeResource(
       : 'system'
     ),
     content,
-    timestamp: Date.now(),
+    timestamp: Date.now() + Math.random(),
     dependencies: opts.deps ?? [],
     meta: {},
     pinned: opts.pinned ?? false,
+  };
+}
+
+function makeCtx(sessionKey: string, turn: number): TransformContext {
+  return {
+    graph: {} as any,
+    runtime: { sessionKey, turn },
   };
 }
 
@@ -47,475 +54,310 @@ const mockModel: Model = {
   contextWindow: 1000, maxTokens: 2048, reasoning: false,
 };
 
-function makeMockStreamFn(text: string): StreamFn {
-  return async function* (): StreamResult {
+/** 记录调用的 mock streamFn（可注入延迟以测试并发） */
+function streamFnRecorder(
+  text: string,
+  opts: { delayMs?: number; fail?: boolean; stopReason?: string } = {},
+): { fn: StreamFn; calls: string[] } {
+  const calls: string[] = [];
+  const fn: StreamFn = async function* (_m, _ctx, streamOptions) {
+    calls.push(streamOptions?.sessionId ?? 'unknown');
+    if (opts.delayMs) await new Promise(r => setTimeout(r, opts.delayMs));
+    if (opts.fail) {
+      yield { type: 'error', message: { role: 'assistant', content: [], errorMessage: 'boom' } as unknown as AssistantMessage };
+      return;
+    }
     yield { type: 'text_delta', delta: text };
+    yield {
+      type: 'done',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        stopReason: opts.stopReason ?? 'stop',
+        usage: { input: 10, output: 5, total: 15 },
+      } as AssistantMessage,
+    };
   };
+  return { fn, calls };
 }
 
-// ─── 防御性校验 ───────────────────────────────────────────────────
+/** 'x'.repeat(n) 的 user 消息（n/4 token） */
+function userMsg(id: string, tokens: number): ContextResource {
+  return makeResource(id, 'user_message', 'x'.repeat(tokens * 4));
+}
 
-test('transformer: contextWindow=0 抛错', () => {
-  assert.throws(
-    () => createCompressionTransformer({
+// ─── 构造校验 ─────────────────────────────────────────────────────
+
+test('transformer: contextWindow=0 / NaN 抛错', () => {
+  for (const bad of [0, NaN, -1]) {
+    assert.throws(() => createCompressionTransformer({
       config: loadCompressionConfig(),
       model: mockModel,
-      streamFn: makeMockStreamFn('x'),
-      contextWindow: 0,
-    }),
-    /Invalid contextWindow/,
-  );
+      streamFn: streamFnRecorder('x').fn,
+      contextWindow: bad,
+    }), /Invalid contextWindow/);
+  }
 });
 
-test('transformer: contextWindow=NaN 抛错', () => {
-  assert.throws(
-    () => createCompressionTransformer({
-      config: loadCompressionConfig(),
-      model: mockModel,
-      streamFn: makeMockStreamFn('x'),
-      contextWindow: NaN,
-    }),
-    /Invalid contextWindow/,
-  );
+test('transformer: 配置非法（target>=trigger）时启动 warn 不抛错', () => {
+  // console.warn 捕获由全局处理；此处只验证不抛错 + validateConfig 检出
+  const cfg = loadCompressionConfig({
+    budget: { targetRatio: 0.9, triggerRatio: 0.8 },
+  });
+  const errors = validateConfig(cfg);
+  assert.ok(errors.some(e => e.path === 'budget.targetRatio'));
+  assert.doesNotThrow(() => createCompressionTransformer({
+    config: cfg,
+    model: mockModel,
+    streamFn: streamFnRecorder('x').fn,
+    contextWindow: 1000,
+  }));
 });
 
-test('transformer: contextWindow=undefined 抛错', () => {
-  assert.throws(
-    () => createCompressionTransformer({
-      config: loadCompressionConfig(),
-      model: mockModel,
-      streamFn: makeMockStreamFn('x'),
-      contextWindow: undefined as unknown as number,
-    }),
-    /Invalid contextWindow/,
-  );
+// ─── 开关与 dryRun ────────────────────────────────────────────────
+
+test('transformer: enabled=false 原样返回', async () => {
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({ enabled: false }),
+    model: mockModel,
+    streamFn: streamFnRecorder('x').fn,
+    contextWindow: 1000,
+  });
+  const resources = [userMsg('u1', 900)];
+  const out = await transformer.transform(resources, makeCtx('s1', 1));
+  assert.equal(out, resources);
 });
 
-// ─── 遥测上报 ─────────────────────────────────────────────────────
-
-test('transformer: 通过 telemetryReporter 直接上报', async () => {
+test('transformer: dryRun 不修改资源，遥测报告将触发的阶段', async () => {
   const reported: CompressionTelemetry[] = [];
-  const reporter: { report: (t: CompressionTelemetry) => void } = {
-    report: (t) => { reported.push(t); },
-  };
-
   const transformer = createCompressionTransformer({
     config: loadCompressionConfig({
-      l1: { toolResultMaxLines: 5, toolResultHeadLines: 1, toolResultTailLines: 1 },
+      dryRun: true,
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.05, targetRatio: 0.02 },
     }),
     model: mockModel,
-    streamFn: makeMockStreamFn('summary'),
-    contextWindow: 100,
-    telemetryReporter: reporter,
+    streamFn: streamFnRecorder('x').fn,
+    contextWindow: 1000,
+    telemetryReporter: { report: t => reported.push(t) },
   });
+  const resources = [userMsg('u1', 100)];
+  const out = await transformer.transform(resources, makeCtx('s1', 1));
 
-  const longText = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
-  const resources = [
-    makeResource('tr1', 'tool_result', longText, { deps: ['c1'] }),
-  ];
-
-  await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-
-  assert.ok(reported.length >= 1, '应有遥测上报');
-  assert.equal(reported[0].level, 'L1');
+  assert.equal(out, resources, 'dryRun 不修改');
+  assert.ok(reported.some(t => t.stage === 'dry_run'), '应有 dry_run 遥测');
+  const dry = reported.find(t => t.stage === 'dry_run')!;
+  assert.ok(dry.message?.includes('trim'), '应标注会运行 trim');
 });
+
+// ─── 压缩主流程 ───────────────────────────────────────────────────
+
+test('transformer: 超高水位触发 trim→summarize，token 下降且遥测上报', async () => {
+  const reported: CompressionTelemetry[] = [];
+  const { fn, calls } = streamFnRecorder('## Context Summary\nall done');
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.05, targetRatio: 0.02 },
+      summarize: { minResourcesToCompress: 2, protectedRecentCount: 2, forkMaxTokens: 100 },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+    telemetryReporter: { report: t => reported.push(t) },
+  });
+
+  // 4 条消息 ~50 token；trigger 50 → 触发；fork 输入预算 1000-100-512=388 → 单块
+  const resources = [
+    userMsg('u1', 50), userMsg('u2', 50), userMsg('u3', 50), userMsg('u4', 50),
+  ];
+  const out = await transformer.transform(resources, makeCtx('compact-1', 1));
+
+  const stages = new Set(reported.map(t => t.stage));
+  assert.ok(stages.has('summarize'), `应触发 summarize（实际: ${[...stages].join(',')}）`);
+
+  const sumT = reported.find(t => t.stage === 'summarize')!;
+  assert.ok(sumT.afterTokens < sumT.beforeTokens, 'token 应净下降');
+  assert.ok(out.some(r => r.type === 'compaction_summary'), '产出摘要资源');
+  assert.ok(out.some(r => r.id === 'u4'), '保护区资源保留');
+  assert.ok(calls.length >= 1, '应有 fork 调用');
+  assert.equal(sumT.messageCountBefore, 4);
+});
+
+test('transformer: 巨型 tool result 由 trim 按 token 裁剪（请求路径零 fork）', async () => {
+  const { fn, calls } = streamFnRecorder('summary');
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.8, targetRatio: 0.4 },
+      trim: { toolResultMaxTokens: 100 },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+  });
+
+  const big = makeResource('tr1', 'tool_result',
+    [{ type: 'text', text: `{"data":"${'x'.repeat(8000)}"}` }],
+    { deps: ['call_1'] });
+  const a1 = makeResource('a1', 'assistant_message',
+    [{ type: 'toolCall', id: 'call_1', name: 'read', arguments: {} }], { deps: ['call_1'] });
+  const tail = [userMsg('u9', 5), userMsg('u10', 5)];
+
+  const out = await transformer.transform([a1, big, ...tail], makeCtx('trim-only', 1));
+  const trimmed = (out.find(r => r.id === 'tr1')!.content as { text: string }[])[0];
+  assert.ok(trimmed.text.includes('truncated'), 'trim 应裁剪');
+  assert.equal(calls.length, 0, 'trim 达标不应有 fork');
+});
+
+// ─── 后台预压缩 ───────────────────────────────────────────────────
+
+test('transformer: 预压缩区间启动后台摘要，高水位应用时零新 fork', async () => {
+  const { fn, calls } = streamFnRecorder('precomputed summary');
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.8, targetRatio: 0.4 },
+      summarize: { minResourcesToCompress: 2, protectedRecentCount: 2, forkMaxTokens: 200 },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+  });
+
+  // Run 1: 总量 ~746 token ∈ [700, 800) 预警区间。
+  // 可压缩区（13 条小消息）transcript 仅 ~26 token，低于 fork 输入预算（288）→ 单次 fork
+  const run1 = [
+    ...Array.from({ length: 13 }, (_, i) => userMsg(`u${i}`, 2)),
+    userMsg('p1', 360), // 保护窗口（最近 2 条）
+    userMsg('p2', 360),
+  ];
+  const out1 = await transformer.transform(run1, makeCtx('precomp', 1));
+  assert.equal(out1, run1, '预警区间不修改资源');
+
+  // 等后台 fork 完成
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(calls.length, 1, '后台应发生 1 次 fork');
+
+  // Run 2: 追加消息 → 超过高水位 800 → 压缩；summarize 应消费预压缩产物
+  const run2 = [...run1, userMsg('u_new', 100)];
+  const out2 = await transformer.transform(run2, makeCtx('precomp', 2));
+
+  assert.ok(out2.some(r => r.type === 'compaction_summary'), '应产出摘要');
+  assert.equal(calls.length, 1, '高水位应直接应用预压缩产物，不再 fork');
+});
+
+// ─── 互斥 ─────────────────────────────────────────────────────────
+
+test('transformer: 同 session 并发 run 真互斥（后到者等待前者完成）', async () => {
+  // fork 带 60ms 延迟：若互斥失效，两个 run 的 fork 会交错
+  const { fn, calls } = streamFnRecorder('summary', { delayMs: 60 });
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.05, targetRatio: 0.02 },
+      summarize: { minResourcesToCompress: 2, protectedRecentCount: 0, forkMaxTokens: 100 },
+      safety: { retry: { retries: 0, baseMs: 1, maxMs: 1 } },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+  });
+
+  const resA = [userMsg('a1', 50), userMsg('a2', 50)];
+  const resB = [userMsg('b1', 50), userMsg('b2', 50)];
+
+  // 并发发起；turn 区分两次 run
+  const [outA, outB] = await Promise.all([
+    transformer.transform(resA, makeCtx('mutex', 1)),
+    transformer.transform(resB, makeCtx('mutex', 2)),
+  ]);
+
+  assert.equal(calls.length, 2, '两次 run 各一次 fork');
+  // 互斥：turn1 的 fork 必须全部先于 turn2 的 fork（sessionId 含 turn 号）
+  const turns = calls.map(id => id.match(/#t(\d+)$/)?.[1]);
+  assert.ok(turns[0] === '1' && turns[1] === '2',
+    `fork 应按 run 顺序串行（实际 ${turns.join(',')}）`);
+  assert.ok(outA !== outB);
+});
+
+// ─── 上下文耗尽事件 ───────────────────────────────────────────────
+
+test('transformer: pinned 全量超限 → truncate 无可丢 → 发出耗尽事件（不永久禁用）', async () => {
+  const events: ContextExhaustedEvent[] = [];
+  const { fn, calls } = streamFnRecorder('HANDOFF: continue the task');
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.8, targetRatio: 0.4 },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+  });
+  transformer.onContextExhausted(e => { events.push(e); });
+
+  const resources = [
+    makeResource('sys1', 'system_message', 'y'.repeat(4000), { pinned: true }),
+    makeResource('sys2', 'system_message', 'z'.repeat(4000), { pinned: true }),
+  ];
+  const out = await transformer.transform(resources, makeCtx('exhaust', 1));
+
+  assert.equal(events.length, 1, '应发出一次耗尽事件');
+  const ev = events[0];
+  assert.equal(ev.reason, 'pinned_overload');
+  assert.ok(ev.suggestedSessionId.startsWith('exhaust_h'), '应有建议新会话 id');
+  assert.equal(ev.fallback, false, 'fork 成功 → 非 fallback');
+  assert.ok(ev.handoffDocument.includes('HANDOFF'), '交接文档来自 fork');
+  assert.ok(ev.tokensAfter > ev.hardLimitTokens);
+
+  // v2 语义：不永久禁用 —— 后续 turn 仍可尝试压缩（这里验证不抛错、资源可返回）
+  const out2 = await transformer.transform(resources, makeCtx('exhaust', 5));
+  assert.ok(Array.isArray(out2));
+  // lifecycle fork 也应被调用（生成交接文档）
+  assert.ok(calls.some(id => id.includes('lifecycle_handoff')), '应调用 lifecycle fork');
+});
+
+test('transformer: lifecycle fork 失败 → fallback 交接文档仍发出', async () => {
+  const events: ContextExhaustedEvent[] = [];
+  const { fn } = streamFnRecorder('', { fail: true });
+  const transformer = createCompressionTransformer({
+    config: loadCompressionConfig({
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.8, targetRatio: 0.4 },
+      safety: { retry: { retries: 0, baseMs: 1, maxMs: 1 } },
+    }),
+    model: mockModel,
+    streamFn: fn,
+    contextWindow: 1000,
+  });
+  transformer.onContextExhausted(e => { events.push(e); });
+
+  // 1200 token > hardLimit 1000 才触发耗尽（1000 token 不大于 hardLimit，不触发）
+  const resources = [
+    makeResource('sys1', 'system_message', 'y'.repeat(4800), { pinned: true }),
+  ];
+  await transformer.transform(resources, makeCtx('exhaust2', 1));
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].fallback, true, 'fork 失败应标记 fallback');
+  assert.ok(events[0].handoffDocument.length > 0, 'fallback 文档非空');
+});
+
+// ─── 遥测通道 ─────────────────────────────────────────────────────
 
 test('transformer: 通过 sharedMap 写入遥测', async () => {
   const sharedMap = new Map<string, unknown>();
   const transformer = createCompressionTransformer({
     config: loadCompressionConfig({
-      l1: { toolResultMaxLines: 5, toolResultHeadLines: 1, toolResultTailLines: 1 },
+      budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.05, targetRatio: 0.02 },
+      summarize: { minResourcesToCompress: 2, protectedRecentCount: 2, forkMaxTokens: 100 },
     }),
     model: mockModel,
-    streamFn: makeMockStreamFn('summary'),
-    contextWindow: 100,
+    streamFn: streamFnRecorder('summary').fn,
+    contextWindow: 1000,
     sharedMap,
   });
 
-  const longText = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
-  const resources = [
-    makeResource('tr1', 'tool_result', longText, { deps: ['c1'] }),
-  ];
-
-  await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
+  await transformer.transform(
+    [userMsg('u1', 50), userMsg('u2', 50), userMsg('u3', 50), userMsg('u4', 50)],
+    makeCtx('shared', 1),
+  );
 
   const telemetry = sharedMap.get(TELEMETRY_SHARED_KEY) as CompressionTelemetry[] | undefined;
   assert.ok(telemetry && telemetry.length >= 1, 'sharedMap 应有遥测');
-  assert.equal(telemetry![0].level, 'L1');
-});
-
-// ─── 熔断器 ───────────────────────────────────────────────────────
-
-test('transformer: maxAttempts 熔断后停止压缩', async () => {
-  // 用极小 maxAttempts + 极大 contextWindow 避免触发压缩，单独验证熔断
-  // 这里通过多次 transform 同一 turn 来累积 attemptCount
-  const config = loadCompressionConfig({
-    safety: { maxAttempts: 1, cooldownTurns: 10 },
-    l1: { enabled: false }, // 关闭 L1，避免触发
-    l2: { enabled: false },
-    l3: { enabled: false },
-    l4: { enabled: false },
-    l5: { enabled: false },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('x'),
-    contextWindow: 1000,
-  });
-
-  // 由于所有级别都 disabled，transform 不会触发任何 attempt
-  // 这个测试主要验证 transformer 不抛错，且 disabled 时透传 resources
-  const resources = [makeResource('u1', 'user_message', 'hello')];
-  const out = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-  assert.equal(out, resources);
-});
-
-// ─── setHandoffHook ───────────────────────────────────────────────
-
-test('transformer: setHandoffHook 在 L5 触发时被调用', async () => {
-  // 构造场景：contextWindow 极小 + 大量内容，强制一路升级到 L5
-  const config = loadCompressionConfig({
-    l1: {
-      enabled: true, threshold: 0.1, targetRatio: 0.05,
-      stripThinking: false, trimToolResults: true,
-      toolResultMaxLines: 1, toolResultHeadLines: 0, toolResultTailLines: 0,
-      normalizeWhitespace: false,
-    },
-    l2: {
-      // 关闭 L2/L3/L4：精确测试 L5 触发时 handoff hook 被调用
-      // （开启时 L2 会先摘要降 token，L5 阈值不再满足）
-      enabled: false, threshold: 0.2, targetRatio: 0.1,
-      forkMaxTokens: 100, minResourcesToCompress: 1,
-      protectedRecentCount: 0, maxCompressionDepth: 5,
-    },
-    l3: { enabled: false, threshold: 0.3, targetRatio: 0.1, forkMaxTokens: 100, protectedRecentCount: 0 },
-    l4: {
-      enabled: false, threshold: 0.4, targetRatio: 0.1,
-      checkpointStorage: 'memory', minWorkingSet: 0,
-      failOnPersistError: false,
-    },
-    l5: { enabled: true, threshold: 0.5, forkMaxTokens: 100 },
-    safety: { maxAttempts: 10, cooldownTurns: 1 },
-  });
-
-  let hookCalled = false;
-  let capturedNewSessionId: string | null = null;
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('handoff doc'),
-    contextWindow: 50, // 极小，强制触发
-  });
-
-  transformer.setHandoffHook(({ handoff }) => {
-    hookCalled = true;
-    capturedNewSessionId = handoff.newSessionId;
-  });
-
-  // 构造大量内容
-  const longText = 'x'.repeat(500);
-  const resources = [
-    makeResource('u1', 'user_message', longText),
-    makeResource('a1', 'assistant_message', longText),
-  ];
-
-  await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-
-  assert.equal(hookCalled, true, 'handoff hook 应被调用');
-  assert.ok(capturedNewSessionId);
-});
-
-// ─── recover API ──────────────────────────────────────────────────
-
-class MockSessionStorage implements SessionStorage {
-  public saved = new Map<string, StoredSession>();
-  async save(key: string, session: StoredSession): Promise<void> {
-    this.saved.set(key, session);
-  }
-  async load(key: string): Promise<StoredSession | null> {
-    return this.saved.get(key) ?? null;
-  }
-  async delete(key: string): Promise<boolean> {
-    return this.saved.delete(key);
-  }
-  async list(): Promise<string[]> {
-    return [...this.saved.keys()];
-  }
-  async clear(): Promise<void> {
-    this.saved.clear();
-  }
-}
-
-test('transformer: recover API 可用', async () => {
-  const storage = new MockSessionStorage();
-  const config = loadCompressionConfig({
-    l1: { enabled: false }, l2: { enabled: false }, l3: { enabled: false },
-    l4: {
-      enabled: true, threshold: 0.1, targetRatio: 0.05,
-      checkpointStorage: 'memory', minWorkingSet: 1,
-      failOnPersistError: true,
-    },
-    l5: { enabled: false },
-    safety: { maxAttempts: 10, cooldownTurns: 1 },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('x'),
-    contextWindow: 10,
-    sessionStorage: storage,
-  });
-
-  const resources = [
-    makeResource('u1', 'user_message', 'r1'),
-    makeResource('u2', 'user_message', 'r2'),
-  ];
-
-  const out = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-
-  const checkpointRef = out.find(r => r.meta._checkpointId);
-  assert.ok(checkpointRef, '应生成 checkpoint_ref');
-  const checkpointId = checkpointRef!.meta._checkpointId as string;
-
-  const recovered = await transformer.recover(checkpointId);
-  assert.ok(recovered, '应能通过 transformer.recover 恢复');
-  assert.ok(recovered!.fullMessages.length > 0);
-});
-
-// ─── P2#18 补充测试 ──────────────────────────────────────────────
-
-test('transformer: dryRun 模式不修改 resources，生成 would_trigger telemetry', async () => {
-  const reported: CompressionTelemetry[] = [];
-  const reporter: { report: (t: CompressionTelemetry) => void } = {
-    report: (t) => { reported.push(t); },
-  };
-
-  const config = loadCompressionConfig({
-    dryRun: true,
-    l1: {
-      enabled: true, threshold: 0.1, targetRatio: 0.05,
-      stripThinking: false, trimToolResults: true,
-      toolResultMaxLines: 1, toolResultHeadLines: 0, toolResultTailLines: 0,
-      normalizeWhitespace: false,
-    },
-    l2: { enabled: false }, l3: { enabled: false }, l4: { enabled: false }, l5: { enabled: false },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('summary'),
-    contextWindow: 100,
-    telemetryReporter: reporter,
-  });
-
-  const longText = 'x'.repeat(500);
-  const resources = [makeResource('u1', 'user_message', longText)];
-
-  const out = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-
-  // P2#14: dryRun 必须透传原 resources（引用相等）
-  assert.equal(out, resources, 'dryRun 不应修改 resources');
-  assert.ok(reported.length >= 1, 'dryRun 也应生成遥测');
-  assert.match(reported[0].action, /dry_run_would_trigger/);
-});
-
-test('transformer: 同 session 并发 transform 被串行化（P1#6）', async () => {
-  const order: string[] = [];
-  const streamFn: StreamFn = async function* (): StreamResult {
-    order.push('start');
-    await new Promise<void>(resolve => setTimeout(resolve, 20));
-    order.push('end');
-    yield { type: 'text_delta', delta: 'summary' };
-  };
-
-  const config = loadCompressionConfig({
-    l1: { enabled: false },
-    l2: {
-      enabled: true, threshold: 0.1, targetRatio: 0.5,
-      forkMaxTokens: 100, minResourcesToCompress: 2,
-      // 注意 protectedRecentCount 不能用 0：slice(-0) 返回整个数组，
-      // 所有资源都会被 recent 保护导致 L2 永不触发
-      protectedRecentCount: 1, maxCompressionDepth: 3,
-    },
-    l3: { enabled: false }, l4: { enabled: false }, l5: { enabled: false },
-    safety: { serializePerSession: true, maxAttempts: 5, cooldownTurns: 1 },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn,
-    contextWindow: 1000,
-  });
-
-  // 内容足够长，确保 token 超过 contextWindow * l2.threshold，触发 L2 fork
-  const longText = 'x'.repeat(300);
-  const resources = [
-    makeResource('u1', 'user_message', longText),
-    makeResource('a1', 'assistant_message', longText, { deps: ['c1'] }),
-    makeResource('tr1', 'tool_result', longText, { deps: ['c1'] }),
-    makeResource('u2', 'user_message', longText),
-  ];
-
-  const ctx = {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  };
-
-  await Promise.all([
-    transformer.transform(resources, ctx),
-    transformer.transform(resources, ctx),
-  ]);
-
-  // 严格串行：start end start end（不能出现 start start end end）
-  assert.deepEqual(order, ['start', 'end', 'start', 'end'], `同 session 并发 run 必须串行化，实际 ${JSON.stringify(order)}`);
-});
-
-// ─── ConsoleTelemetryReporter 配置项 ──────────────────────────────
-
-test('ConsoleTelemetryReporter: logTokenDelta=false 时不输出 tokenDelta', () => {
-  const origLog = console.log;
-  const logs: string[] = [];
-  console.log = (msg: string) => { logs.push(msg); };
-
-  try {
-    const reporter = new ConsoleTelemetryReporter({
-      logTokenDelta: false,
-      logTriggerReason: false,
-    });
-    reporter.report({
-      timestamp: 0, sessionKey: 's', turn: 1, level: 'L1', action: 'a',
-      beforeTokens: 100, afterTokens: 50, resourcesAffected: 1,
-      triggerReason: 'threshold_exceeded', cachePreserved: true,
-      compressionDepth: 0, duration: 0,
-    });
-
-    const payload = JSON.parse(logs[0]);
-    assert.equal(payload.tokenDelta, undefined);
-    assert.equal(payload.triggerReason, undefined);
-    assert.equal(payload.beforeTokens, 100);
-  } finally {
-    console.log = origLog;
-  }
-});
-
-// ─── P1 遗留修复测试 ─────────────────────────────────────────────
-
-test('transformer: compressionDepth 跨 turn 重置（L2 不会永久失效）', async () => {
-  // maxCompressionDepth=1：每 turn 只允许一次 L2。
-  // 若 compressionDepth 跨 turn 累积，第二 turn 会被拦截 → L2 永不再次触发。
-  const config = loadCompressionConfig({
-    l1: { enabled: false },
-    l2: {
-      enabled: true, threshold: 0.1, targetRatio: 0.5,
-      forkMaxTokens: 100, minResourcesToCompress: 2,
-      protectedRecentCount: 1, maxCompressionDepth: 1,
-    },
-    l3: { enabled: false }, l4: { enabled: false }, l5: { enabled: false },
-    safety: { maxAttempts: 10, cooldownTurns: 1 },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('summary'),
-    contextWindow: 1000,
-  });
-
-  const longText = 'x'.repeat(300);
-  const resources = [
-    makeResource('u1', 'user_message', longText),
-    makeResource('a1', 'assistant_message', longText, { deps: ['c1'] }),
-    makeResource('tr1', 'tool_result', longText, { deps: ['c1'] }),
-    makeResource('u2', 'user_message', longText),
-  ];
-
-  // turn 1：应触发一次 L2（compressionDepth 0 → 1）
-  const out1 = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-  assert.ok(out1.some(r => r.type === 'compaction_summary'), 'turn 1 应生成 compaction_summary');
-
-  // turn 2：compressionDepth 必须重置为 0，L2 才能再次触发
-  const out2 = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 2 },
-  });
-  assert.ok(out2.some(r => r.type === 'compaction_summary'), 'turn 2 的 L2 不应因深度累积被跳过');
-});
-
-test('transformer: recover 返回 fullResources（pinned/meta/type 不丢失）', async () => {
-  const storage = new MockSessionStorage();
-  const config = loadCompressionConfig({
-    l1: { enabled: false }, l2: { enabled: false }, l3: { enabled: false },
-    l4: {
-      enabled: true, threshold: 0.1, targetRatio: 0.05,
-      checkpointStorage: 'memory', minWorkingSet: 1,
-      failOnPersistError: true,
-    },
-    l5: { enabled: false },
-    safety: { maxAttempts: 10, cooldownTurns: 1 },
-  });
-
-  const transformer = createCompressionTransformer({
-    config,
-    model: mockModel,
-    streamFn: makeMockStreamFn('x'),
-    contextWindow: 10,
-    sessionStorage: storage,
-  });
-
-  // pinned + meta 的关键资源（经 messages 往返会丢失，fullResources 必须保留）
-  const resources = [
-    makeResource('u1', 'user_message', 'r1'),
-    {
-      ...makeResource('sum1', 'compaction_summary', '[merged history]'),
-      pinned: true,
-      meta: { _compressionLevel: 2, _sourceCount: 5 },
-    },
-    makeResource('u2', 'user_message', 'r2'),
-  ];
-
-  const out = await transformer.transform(resources, {
-    graph: {} as any,
-    runtime: { sessionKey: 's1', turn: 1 },
-  });
-
-  const checkpointRef = out.find(r => r.meta._checkpointId);
-  assert.ok(checkpointRef, '应生成 checkpoint_ref');
-  const checkpointId = checkpointRef!.meta._checkpointId as string;
-
-  const recovered = await transformer.recover(checkpointId);
-  assert.ok(recovered, '应能恢复');
-  assert.ok(Array.isArray(recovered!.fullResources), '应还原 fullResources 快照');
-
-  const sum = recovered!.fullResources!.find(r => r.id === 'sum1');
-  assert.ok(sum, 'fullResources 应包含被压缩的 pinned 资源');
-  assert.equal(sum!.pinned, true, 'pinned 语义不应丢失');
-  assert.equal(sum!.meta._compressionLevel, 2, 'meta 不应丢失');
-  assert.equal(sum!.type, 'compaction_summary', 'type 不应丢失');
+  assert.ok(telemetry!.every(t => typeof t.stage === 'string'));
 });

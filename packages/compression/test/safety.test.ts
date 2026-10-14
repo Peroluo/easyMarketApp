@@ -36,21 +36,20 @@ test('canCompress: 跨 turn 重置 attemptCount', () => {
   const guard = new CompressionSafetyGuard({ maxAttempts: 2, cooldownTurns: 5 });
   const state = createSafetyState({ forkTimeoutMs: 0 });
 
-  // turn 1: 允许压缩，累积 2 次后熔断
+  // turn 1: 允许压缩，累积 2 次后进入冷却
   assert.equal(guard.canCompress(state, 1), true);
   guard.recordAttempt(state);
   assert.equal(guard.canCompress(state, 1), true);
   guard.recordAttempt(state);
-  // 第 3 次应被熔断
+  // 第 3 次应被拒（attempt 耗尽）并进入冷却
   assert.equal(guard.canCompress(state, 1), false);
-  assert.equal(state.circuitBreakerTripped, true);
   assert.equal(state.cooldownRemaining, 5);
 
   // turn 1 内继续调用：仍在冷却，递减
   assert.equal(guard.canCompress(state, 1), false);
   assert.equal(state.cooldownRemaining, 4);
 
-  // turn 2: 跨 turn 不会自动重置（因为有 cooldown）；继续冷却
+  // turn 2: 跨 turn 重置 attempt，但冷却期内继续拒绝
   assert.equal(guard.canCompress(state, 2), false);
 });
 
@@ -58,27 +57,33 @@ test('canCompress: cooldown 耗尽后恢复', () => {
   const guard = new CompressionSafetyGuard({ maxAttempts: 1, cooldownTurns: 2 });
   const state = createSafetyState({ forkTimeoutMs: 0 });
 
-  // turn 1: 1 次即熔断
+  // turn 1: 1 次即耗尽
   assert.equal(guard.canCompress(state, 1), true);
   guard.recordAttempt(state);
   assert.equal(guard.canCompress(state, 1), false);
-  assert.equal(state.circuitBreakerTripped, true);
   assert.equal(state.cooldownRemaining, 2);
 
   // 模拟跨 turn 调用，每次 cooldown 递减
   guard.canCompress(state, 2); // cooldown 2->1
   guard.canCompress(state, 3); // cooldown 1->0，但仍返回 false（在递减分支）
-  // 下一次：cooldown 已为 0，应解除熔断
+  // 下一次：cooldown 已为 0，恢复允许
   assert.equal(guard.canCompress(state, 4), true);
-  assert.equal(state.circuitBreakerTripped, false);
 });
 
-test('canCompress: handoffCompleted 后永远拒绝', () => {
-  const guard = new CompressionSafetyGuard({ maxAttempts: 10, cooldownTurns: 1 });
+test('canCompress: v2 不再有"永久禁用"——同 turn 内耗尽后拒绝，新 turn 冷却后恢复', () => {
+  const guard = new CompressionSafetyGuard({ maxAttempts: 3, cooldownTurns: 1 });
   const state = createSafetyState({ forkTimeoutMs: 0 });
-  state.handoffCompleted = true;
-  assert.equal(guard.canCompress(state, 1), false);
-  assert.equal(guard.canCompress(state, 2), false);
+
+  for (let i = 0; i < 3; i++) {
+    assert.equal(guard.canCompress(state, 10), true, `第 ${i + 1} 次应允许`);
+    guard.recordAttempt(state);
+  }
+  // 耗尽后同 turn 拒绝
+  assert.equal(guard.canCompress(state, 10), false);
+  // 新 turn：attempt 重置，冷却 1 递减后仍拒绝
+  assert.equal(guard.canCompress(state, 11), false);
+  // 冷却结束，恢复
+  assert.equal(guard.canCompress(state, 12), true);
 });
 
 test('createSafetyState: sessionAbortController 总是存在且不自动 abort', () => {

@@ -1,12 +1,14 @@
 /**
- * 压缩配置 - 所有阈值支持环境变量覆盖
+ * 压缩配置 - v2 策略管道架构
  *
- * 注意：所有 `targetRatio` 表示"压缩后目标 token 占 contextWindow 的比例"，
- * 当单次压缩未达到目标时，转换器会按级向上升级。
- * `forkModel` 为空表示复用主模型；`forkMaxTokens` 限制 fork 输出长度。
+ * 相比 v1（L1~L5 五级阈值瀑布）的变化：
+ *   - 五级 threshold/targetRatio 矩阵 → budget 双水位（trigger/target/precompress）
+ *   - 级别开关 → 策略开关（trim / summarize / truncate）
+ *   - 会话生命周期（检查点/交接）拆到 lifecycle，由 host 通过事件处理
+ *
+ * 环境变量加载支持显式 0 值（修复 v1 `Number(env.X) || default` 无法设置 0 的问题）。
  */
 
-import type { ResourceType } from '@aipack-ai/agent';
 import type { RetryConfig } from './retry';
 
 // ─── 配置接口 ─────────────────────────────────────────────────────
@@ -14,84 +16,89 @@ import type { RetryConfig } from './retry';
 export interface CompressionConfig {
   enabled: boolean;
 
-  /** 估算器类型（当前仅支持 'char-heuristic'） */
-  estimator: 'char-heuristic';
-  /** 估算器缓存容量 */
-  estimatorCacheCapacity: number;
-  charsPerToken: { ascii: number; cjk: number };
+  estimator: {
+    charsPerTokenAscii: number;
+    charsPerTokenCJK: number;
+    /** 每个图片块的估算 token */
+    imageTokensPerBlock: number;
+    /** string 缓存容量 */
+    cacheCapacity: number;
+  };
 
-  /** fork 调用超时（ms），0 表示不超时 */
-  forkTimeoutMs: number;
-
-  /** L1: 工具输出裁剪 */
-  l1: {
-    enabled: boolean;
-    threshold: number;
+  budget: {
+    /**
+     * 为模型输出预留的 token。
+     * 缺省（undefined）= 取 model.maxTokens；设 0 表示不预留（不推荐）。
+     */
+    outputReserveTokens?: number;
+    /** 相对 contextWindow 的安全边距比例（估算误差缓冲） */
+    safetyMarginRatio: number;
+    /** 高水位：达到 effective × triggerRatio 触发压缩 */
+    triggerRatio: number;
+    /** 低水位：压缩目标 */
     targetRatio: number;
+    /** 预压缩启动线（须 < triggerRatio） */
+    precompressRatio: number;
+  };
+
+  /** 策略 1：无损裁剪（thinking 剥离、tool result 按 token 预算裁剪、空白规范化） */
+  trim: {
+    enabled: boolean;
     stripThinking: boolean;
     trimToolResults: boolean;
-    toolResultMaxLines: number;
+    normalizeWhitespace: boolean;
+    /** 单个 tool_result 的 token 预算，超过即裁剪（按 token 而非行数，单行大输出同样生效） */
+    toolResultMaxTokens: number;
     toolResultHeadLines: number;
     toolResultTailLines: number;
-    normalizeWhitespace: boolean;
+    /** 裁剪时保留的关键行上限（error/fail/exception 等匹配行） */
+    keyLineLimit: number;
   };
 
-  /** L2: 旧消息摘要 */
-  l2: {
+  /** 策略 2：有损摘要（fork 模型，支持 map-reduce 分块，pinned 摘要再摘要） */
+  summarize: {
     enabled: boolean;
-    threshold: number;
-    targetRatio: number;
-    /** fork 用模型 id；为空则复用主模型 */
     forkModel?: string;
-    /** fork 输出 max tokens 上限（覆盖 Model.maxTokens） */
     forkMaxTokens: number;
+    /** 可压缩资源少于该数则跳过摘要 */
     minResourcesToCompress: number;
+    /** 保护最近的 N 条资源不参与摘要 */
     protectedRecentCount: number;
-    /** 单次 pipeline 内最大压缩深度（不跨 turn 累积） */
-    maxCompressionDepth: number;
+    /** map-reduce 单块 transcript token 预算（0 = 不分块，按 fork 窗口自动决定） */
+    maxChunkTokens: number;
+    /**
+     * pinned 历史摘要再摘要触发比例：旧摘要总量超过 effective × 该值时，
+     * 并入本次摘要一并再压缩（修复 v1 假合并只拼接不减 token 的问题）
+     */
+    pinnedReSummarizeRatio: number;
   };
 
-  /** L3: 任务状态提取 */
-  l3: {
+  /** 策略 3：硬截断保底（按工具对整体丢弃最旧非 pinned 资源） */
+  truncate: {
     enabled: boolean;
-    threshold: number;
-    targetRatio: number;
-    forkModel?: string;
-    forkMaxTokens: number;
-    protectedRecentCount: number;
-  };
-
-  /** L4: 会话检查点 */
-  l4: {
-    enabled: boolean;
-    threshold: number;
-    targetRatio: number;
-    /** 检查点存储后端类型（仅用于遥测标注，实际后端由 sessionStorage 决定） */
-    checkpointStorage: 'file' | 'memory' | 'custom';
+    /** 保护最近 N 条非 pinned 资源不被丢弃 */
     minWorkingSet: number;
-    /** 持久化失败时是否中止压缩（推荐 true，避免信息丢失） */
-    failOnPersistError: boolean;
   };
 
-  /** L5: 新会话交接 */
-  l5: {
+  /** 会话生命周期：上下文耗尽事件（检查点/交接由 host 处理，压缩器只发事件） */
+  lifecycle: {
     enabled: boolean;
-    threshold: number;
     forkModel?: string;
     forkMaxTokens: number;
   };
 
   safety: {
+    /** 单 turn 内最大压缩尝试次数（跨 level 累加，跨 turn 重置） */
     maxAttempts: number;
+    /** 尝试耗尽后的冷却 turn 数（失败退避，不再永久禁用） */
     cooldownTurns: number;
-    forkTimeoutMs?: number;
-    /** P0#4: fork 调用重试配置 */
+    forkTimeoutMs: number;
     retry: RetryConfig;
-    /** P1#6: 同 session 是否强制串行化（默认 true） */
+    /** 同 session 是否强制串行化 */
     serializePerSession: boolean;
   };
 
-  /** P2#14: dryRun 模式：只算 token + 生成 telemetry，不修改 resources */
+  /** 只算 token + 生成遥测，不修改资源 */
   dryRun: boolean;
 
   telemetry: {
@@ -101,15 +108,6 @@ export interface CompressionConfig {
   };
 }
 
-// ─── 默认值 ───────────────────────────────────────────────────────
-
-const DEFAULT_DROP_ORDER: ResourceType[] = [
-  'tool_result',
-  'tool_call',
-  'user_message',
-  'assistant_message',
-];
-
 // ─── 深度部分类型 ─────────────────────────────────────────────────
 
 /** 深度部分类型，允许只覆盖嵌套对象的某些字段 */
@@ -117,92 +115,103 @@ export type DeepPartial<T> = {
   [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P];
 };
 
-// ─── 环境变量加载 ─────────────────────────────────────────────────
+// ─── 环境变量工具（支持显式 0 值） ─────────────────────────────────
+
+function envNum(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function envBool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  return raw === 'true' || raw === '1';
+}
+
+function envStr(name: string): string | undefined {
+  const raw = process.env[name];
+  return raw && raw !== '' ? raw : undefined;
+}
+
+// ─── 默认配置加载 ─────────────────────────────────────────────────
 
 export function loadCompressionConfig(
   overrides?: DeepPartial<CompressionConfig>,
 ): CompressionConfig {
   const env = process.env;
 
-  const forkTimeoutMs = Number(env.AIPACK_COMPRESSION_FORK_TIMEOUT) || 30_000;
-
   const config: CompressionConfig = {
-    enabled: env.AIPACK_COMPRESSION_ENABLED !== 'false',
-    estimator: 'char-heuristic',
-    estimatorCacheCapacity: Number(env.AIPACK_COMPRESSION_ESTIMATOR_CACHE) || 1000,
-    charsPerToken: {
-      ascii: Number(env.AIPACK_CHARS_PER_TOKEN_ASCII) || 4,
-      cjk: Number(env.AIPACK_CHARS_PER_TOKEN_CJK) || 1.5,
+    enabled: envBool('AIPACK_COMPRESSION_ENABLED', true),
+
+    estimator: {
+      charsPerTokenAscii: envNum('AIPACK_CHARS_PER_TOKEN_ASCII', 4),
+      charsPerTokenCJK: envNum('AIPACK_CHARS_PER_TOKEN_CJK', 1.5),
+      imageTokensPerBlock: envNum('AIPACK_IMAGE_TOKENS_PER_BLOCK', 1500),
+      cacheCapacity: envNum('AIPACK_ESTIMATOR_CACHE', 1000),
     },
 
-    forkTimeoutMs,
-
-    l1: {
-      enabled: env.AIPACK_L1_ENABLED !== 'false',
-      threshold: Number(env.AIPACK_L1_THRESHOLD) || 0.60,
-      targetRatio: Number(env.AIPACK_L1_TARGET) || 0.50,
-      stripThinking: env.AIPACK_L1_STRIP_THINKING !== 'false',
-      trimToolResults: env.AIPACK_L1_TRIM_TOOL_RESULTS !== 'false',
-      toolResultMaxLines: Number(env.AIPACK_L1_TOOL_MAX_LINES) || 50,
-      toolResultHeadLines: Number(env.AIPACK_L1_TOOL_HEAD_LINES) || 10,
-      toolResultTailLines: Number(env.AIPACK_L1_TOOL_TAIL_LINES) || 10,
-      normalizeWhitespace: env.AIPACK_L1_NORMALIZE_WS !== 'false',
+    budget: {
+      outputReserveTokens: env.AIPACK_COMPRESSION_OUTPUT_RESERVE !== undefined
+        ? envNum('AIPACK_COMPRESSION_OUTPUT_RESERVE', 0)
+        : undefined,
+      safetyMarginRatio: envNum('AIPACK_COMPRESSION_MARGIN_RATIO', 0.05),
+      triggerRatio: envNum('AIPACK_COMPRESSION_TRIGGER_RATIO', 0.80),
+      targetRatio: envNum('AIPACK_COMPRESSION_TARGET_RATIO', 0.40),
+      precompressRatio: envNum('AIPACK_COMPRESSION_PRECOMPRESS_RATIO', 0.70),
     },
 
-    l2: {
-      enabled: env.AIPACK_L2_ENABLED !== 'false',
-      threshold: Number(env.AIPACK_L2_THRESHOLD) || 0.75,
-      targetRatio: Number(env.AIPACK_L2_TARGET) || 0.60,
-      forkModel: env.AIPACK_L2_FORK_MODEL || undefined,
-      forkMaxTokens: Number(env.AIPACK_L2_FORK_MAX_TOKENS) || 2048,
-      minResourcesToCompress: Number(env.AIPACK_L2_MIN_RESOURCES) || 4,
-      protectedRecentCount: Number(env.AIPACK_L2_PROTECTED_RECENT) || 6,
-      maxCompressionDepth: Number(env.AIPACK_L2_MAX_DEPTH) || 3,
+    trim: {
+      enabled: envBool('AIPACK_TRIM_ENABLED', true),
+      stripThinking: envBool('AIPACK_TRIM_STRIP_THINKING', true),
+      trimToolResults: envBool('AIPACK_TRIM_TOOL_RESULTS', true),
+      normalizeWhitespace: envBool('AIPACK_TRIM_NORMALIZE_WS', true),
+      toolResultMaxTokens: envNum('AIPACK_TRIM_TOOL_MAX_TOKENS', 2000),
+      toolResultHeadLines: envNum('AIPACK_TRIM_TOOL_HEAD_LINES', 10),
+      toolResultTailLines: envNum('AIPACK_TRIM_TOOL_TAIL_LINES', 10),
+      keyLineLimit: envNum('AIPACK_TRIM_KEY_LINE_LIMIT', 5),
     },
 
-    l3: {
-      enabled: env.AIPACK_L3_ENABLED !== 'false',
-      threshold: Number(env.AIPACK_L3_THRESHOLD) || 0.85,
-      targetRatio: Number(env.AIPACK_L3_TARGET) || 0.40,
-      forkModel: env.AIPACK_L3_FORK_MODEL || undefined,
-      forkMaxTokens: Number(env.AIPACK_L3_FORK_MAX_TOKENS) || 1024,
-      protectedRecentCount: Number(env.AIPACK_L3_PROTECTED_RECENT) || 4,
+    summarize: {
+      enabled: envBool('AIPACK_SUMMARIZE_ENABLED', true),
+      forkModel: envStr('AIPACK_SUMMARIZE_FORK_MODEL'),
+      forkMaxTokens: envNum('AIPACK_SUMMARIZE_FORK_MAX_TOKENS', 2048),
+      minResourcesToCompress: envNum('AIPACK_SUMMARIZE_MIN_RESOURCES', 4),
+      protectedRecentCount: envNum('AIPACK_SUMMARIZE_PROTECTED_RECENT', 6),
+      maxChunkTokens: envNum('AIPACK_SUMMARIZE_MAX_CHUNK_TOKENS', 24000),
+      pinnedReSummarizeRatio: envNum('AIPACK_SUMMARIZE_PINNED_RESUMMARY_RATIO', 0.05),
     },
 
-    l4: {
-      enabled: env.AIPACK_L4_ENABLED !== 'false',
-      threshold: Number(env.AIPACK_L4_THRESHOLD) || 0.92,
-      targetRatio: Number(env.AIPACK_L4_TARGET) || 0.25,
-      checkpointStorage: (env.AIPACK_L4_STORAGE as CompressionConfig['l4']['checkpointStorage']) ?? 'file',
-      minWorkingSet: Number(env.AIPACK_L4_MIN_WORKING_SET) || 2,
-      failOnPersistError: env.AIPACK_L4_FAIL_ON_PERSIST_ERROR !== 'false',
+    truncate: {
+      enabled: envBool('AIPACK_TRUNCATE_ENABLED', true),
+      minWorkingSet: envNum('AIPACK_TRUNCATE_MIN_WORKING_SET', 2),
     },
 
-    l5: {
-      enabled: env.AIPACK_L5_ENABLED !== 'false',
-      threshold: Number(env.AIPACK_L5_THRESHOLD) || 0.95,
-      forkModel: env.AIPACK_L5_FORK_MODEL || undefined,
-      forkMaxTokens: Number(env.AIPACK_L5_FORK_MAX_TOKENS) || 2048,
+    lifecycle: {
+      enabled: envBool('AIPACK_LIFECYCLE_ENABLED', true),
+      forkModel: envStr('AIPACK_LIFECYCLE_FORK_MODEL'),
+      forkMaxTokens: envNum('AIPACK_LIFECYCLE_FORK_MAX_TOKENS', 2048),
     },
 
     safety: {
-      maxAttempts: Number(env.AIPACK_COMPRESSION_MAX_ATTEMPTS) || 5,
-      cooldownTurns: Number(env.AIPACK_COMPRESSION_COOLDOWN_TURNS) || 5,
-      forkTimeoutMs,
+      maxAttempts: envNum('AIPACK_COMPRESSION_MAX_ATTEMPTS', 5),
+      cooldownTurns: envNum('AIPACK_COMPRESSION_COOLDOWN_TURNS', 3),
+      forkTimeoutMs: envNum('AIPACK_COMPRESSION_FORK_TIMEOUT', 30_000),
       retry: {
-        retries: Number(env.AIPACK_FORK_RETRY_COUNT) || 2,
-        baseMs: Number(env.AIPACK_FORK_RETRY_BASE_MS) || 500,
-        maxMs: Number(env.AIPACK_FORK_RETRY_MAX_MS) || 4000,
+        retries: envNum('AIPACK_FORK_RETRY_COUNT', 2),
+        baseMs: envNum('AIPACK_FORK_RETRY_BASE_MS', 500),
+        maxMs: envNum('AIPACK_FORK_RETRY_MAX_MS', 4000),
       },
-      serializePerSession: env.AIPACK_COMPRESSION_SERIALIZE !== 'false',
+      serializePerSession: envBool('AIPACK_COMPRESSION_SERIALIZE', true),
     },
 
-    dryRun: env.AIPACK_COMPRESSION_DRY_RUN === 'true',
+    dryRun: envBool('AIPACK_COMPRESSION_DRY_RUN', false),
 
     telemetry: {
-      enabled: env.AIPACK_COMPRESSION_TELEMETRY !== 'false',
-      logTokenDelta: env.AIPACK_COMPRESSION_TELEMETRY_LOG_DELTA !== 'false',
-      logTriggerReason: env.AIPACK_COMPRESSION_TELEMETRY_LOG_REASON !== 'false',
+      enabled: envBool('AIPACK_COMPRESSION_TELEMETRY', true),
+      logTokenDelta: envBool('AIPACK_COMPRESSION_TELEMETRY_LOG_DELTA', true),
+      logTriggerReason: envBool('AIPACK_COMPRESSION_TELEMETRY_LOG_REASON', true),
     },
   };
 
@@ -212,28 +221,21 @@ export function loadCompressionConfig(
   return config;
 }
 
-/** 导出默认丢弃顺序 */
-export { DEFAULT_DROP_ORDER };
-
 // ─── 配置校验 ─────────────────────────────────────────────────────
 
 export interface ConfigValidationError {
   path: string;
   message: string;
-  /** 'warn' 表示回退默认值，'error' 表示应拒绝启动 */
   severity: 'warn' | 'error';
 }
 
 /**
- * P1#13: 校验压缩配置边界值。
- * - threshold/targetRatio 必须在 [0, 1]
- * - 各级 threshold 必须递增（l1 < l2 < l3 < l4 < l5）
- * - charsPerToken / forkMaxTokens / maxAttempts / cooldownTurns 必须 > 0
- * - retry.retries >= 0，retry.baseMs/maxMs > 0
- * - engine 字段非法时回退默认
+ * 校验压缩配置。
+ * - 各比例必须在 (0, 1]
+ * - 双水位关系：target < trigger，precompress < trigger
+ * - 正数字段必须 > 0
  *
- * 默认仅 warn（不抛错），让 config 在生产环境即使配错也能启动。
- * 设 strict=true 时会抛出第一个 error 级问题。
+ * 默认仅 warn（不抛错），生产环境配错也能启动；strict=true 时抛出首个 error。
  */
 export function validateConfig(
   config: CompressionConfig,
@@ -241,76 +243,77 @@ export function validateConfig(
 ): ConfigValidationError[] {
   const errors: ConfigValidationError[] = [];
 
-  const assertRange = (
-    path: string,
-    value: number,
-    min: number,
-    max: number,
-    severity: 'warn' | 'error' = 'warn',
-  ) => {
-    if (!Number.isFinite(value) || value < min || value > max) {
-      errors.push({ path, message: `${value} 不在 [${min}, ${max}] 范围`, severity });
-    }
-  };
-  const assertPositive = (path: string, value: number, severity: 'warn' | 'error' = 'warn') => {
-    if (!Number.isFinite(value) || value <= 0) {
-      errors.push({ path, message: `${value} 必须 > 0`, severity });
-    }
-  };
-  const assertNonNegative = (path: string, value: number, severity: 'warn' | 'error' = 'warn') => {
-    if (!Number.isFinite(value) || value < 0) {
-      errors.push({ path, message: `${value} 必须 >= 0`, severity });
-    }
-  };
-
-  assertPositive('charsPerToken.ascii', config.charsPerToken.ascii);
-  assertPositive('charsPerToken.cjk', config.charsPerToken.cjk);
-  assertNonNegative('estimatorCacheCapacity', config.estimatorCacheCapacity);
-  assertNonNegative('forkTimeoutMs', config.forkTimeoutMs);
-
-  assertRange('l1.threshold', config.l1.threshold, 0, 1);
-  assertRange('l1.targetRatio', config.l1.targetRatio, 0, 1);
-  assertRange('l2.threshold', config.l2.threshold, 0, 1);
-  assertRange('l2.targetRatio', config.l2.targetRatio, 0, 1);
-  assertRange('l3.threshold', config.l3.threshold, 0, 1);
-  assertRange('l3.targetRatio', config.l3.targetRatio, 0, 1);
-  assertRange('l4.threshold', config.l4.threshold, 0, 1);
-  assertRange('l4.targetRatio', config.l4.targetRatio, 0, 1);
-  assertRange('l5.threshold', config.l5.threshold, 0, 1);
-
-  assertPositive('l1.toolResultMaxLines', config.l1.toolResultMaxLines);
-  assertPositive('l2.forkMaxTokens', config.l2.forkMaxTokens);
-  assertPositive('l2.minResourcesToCompress', config.l2.minResourcesToCompress);
-  assertNonNegative('l2.protectedRecentCount', config.l2.protectedRecentCount);
-  assertPositive('l2.maxCompressionDepth', config.l2.maxCompressionDepth);
-  assertPositive('l3.forkMaxTokens', config.l3.forkMaxTokens);
-  assertNonNegative('l3.protectedRecentCount', config.l3.protectedRecentCount);
-  assertNonNegative('l4.minWorkingSet', config.l4.minWorkingSet);
-  assertPositive('l5.forkMaxTokens', config.l5.forkMaxTokens);
-
-  assertPositive('safety.maxAttempts', config.safety.maxAttempts);
-  assertNonNegative('safety.cooldownTurns', config.safety.cooldownTurns);
-  assertNonNegative('safety.retry.retries', config.safety.retry.retries);
-  assertPositive('safety.retry.baseMs', config.safety.retry.baseMs);
-  assertPositive('safety.retry.maxMs', config.safety.retry.maxMs);
-
-  // 各级 threshold 应单调递增（避免 L1 阈值比 L5 高导致顺序乱）
-  const thresholds = [
-    ['l1', config.l1.threshold],
-    ['l2', config.l2.threshold],
-    ['l3', config.l3.threshold],
-    ['l4', config.l4.threshold],
-    ['l5', config.l5.threshold],
-  ] as const;
-  for (let i = 1; i < thresholds.length; i++) {
-    if (thresholds[i][1] < thresholds[i - 1][1]) {
+  const assertRatio = (path: string, value: number, allowZero = false) => {
+    const min = allowZero ? 0 : 0;
+    if (!Number.isFinite(value) || value <= min || value > 1) {
       errors.push({
-        path: `${thresholds[i][0]}.threshold`,
-        message: `${thresholds[i][0]}.threshold=${thresholds[i][1]} 小于 ${thresholds[i - 1][0]}.threshold=${thresholds[i - 1][1]}，建议各级阈值单调递增`,
+        path,
+        message: `${value} 必须在 (${allowZero ? '0' : '0'}, 1] 范围`,
         severity: 'warn',
       });
     }
+  };
+  const assertPositive = (path: string, value: number) => {
+    if (!Number.isFinite(value) || value <= 0) {
+      errors.push({ path, message: `${value} 必须 > 0`, severity: 'warn' });
+    }
+  };
+  const assertNonNegative = (path: string, value: number) => {
+    if (!Number.isFinite(value) || value < 0) {
+      errors.push({ path, message: `${value} 必须 >= 0`, severity: 'warn' });
+    }
+  };
+
+  assertPositive('estimator.charsPerTokenAscii', config.estimator.charsPerTokenAscii);
+  assertPositive('estimator.charsPerTokenCJK', config.estimator.charsPerTokenCJK);
+  assertPositive('estimator.imageTokensPerBlock', config.estimator.imageTokensPerBlock);
+  assertNonNegative('estimator.cacheCapacity', config.estimator.cacheCapacity);
+
+  if (config.budget.outputReserveTokens !== undefined) {
+    assertNonNegative('budget.outputReserveTokens', config.budget.outputReserveTokens);
   }
+  assertRatio('budget.safetyMarginRatio', config.budget.safetyMarginRatio, true);
+  assertRatio('budget.triggerRatio', config.budget.triggerRatio);
+  assertRatio('budget.targetRatio', config.budget.targetRatio);
+  assertRatio('budget.precompressRatio', config.budget.precompressRatio);
+
+  // 双水位关系：低水位必须低于高水位，预压缩线必须低于高水位
+  if (config.budget.targetRatio >= config.budget.triggerRatio) {
+    errors.push({
+      path: 'budget.targetRatio',
+      message: `targetRatio(${config.budget.targetRatio}) 应小于 triggerRatio(${config.budget.triggerRatio})，否则压缩无摊薄效果`,
+      severity: 'warn',
+    });
+  }
+  if (config.budget.precompressRatio >= config.budget.triggerRatio) {
+    errors.push({
+      path: 'budget.precompressRatio',
+      message: `precompressRatio(${config.budget.precompressRatio}) 应小于 triggerRatio(${config.budget.triggerRatio})，否则预压缩永远不会启动`,
+      severity: 'warn',
+    });
+  }
+
+  assertPositive('trim.toolResultMaxTokens', config.trim.toolResultMaxTokens);
+  assertNonNegative('trim.toolResultHeadLines', config.trim.toolResultHeadLines);
+  assertNonNegative('trim.toolResultTailLines', config.trim.toolResultTailLines);
+  assertNonNegative('trim.keyLineLimit', config.trim.keyLineLimit);
+
+  assertPositive('summarize.forkMaxTokens', config.summarize.forkMaxTokens);
+  assertPositive('summarize.minResourcesToCompress', config.summarize.minResourcesToCompress);
+  assertNonNegative('summarize.protectedRecentCount', config.summarize.protectedRecentCount);
+  assertNonNegative('summarize.maxChunkTokens', config.summarize.maxChunkTokens);
+  assertRatio('summarize.pinnedReSummarizeRatio', config.summarize.pinnedReSummarizeRatio, true);
+
+  assertNonNegative('truncate.minWorkingSet', config.truncate.minWorkingSet);
+
+  assertPositive('lifecycle.forkMaxTokens', config.lifecycle.forkMaxTokens);
+
+  assertPositive('safety.maxAttempts', config.safety.maxAttempts);
+  assertNonNegative('safety.cooldownTurns', config.safety.cooldownTurns);
+  assertNonNegative('safety.forkTimeoutMs', config.safety.forkTimeoutMs);
+  assertNonNegative('safety.retry.retries', config.safety.retry.retries);
+  assertPositive('safety.retry.baseMs', config.safety.retry.baseMs);
+  assertPositive('safety.retry.maxMs', config.safety.retry.maxMs);
 
   if (strict) {
     const firstError = errors.find(e => e.severity === 'error');

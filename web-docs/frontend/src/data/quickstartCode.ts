@@ -36,7 +36,7 @@ export const qsCliQuickstartCode = [
   '',
   '# 完整能力见 CLI 工具页：',
   '#   内置工具 find/grep/ls/task（子 agent）、项目记忆文件、',
-  '#   Skills / MCP / Hooks、五级上下文压缩',
+  '#   Skills / MCP / Hooks、策略管道上下文压缩',
 ].join('\n');
 
 export const qsEnvCode = [

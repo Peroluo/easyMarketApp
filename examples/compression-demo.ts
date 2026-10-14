@@ -1,12 +1,11 @@
 /**
- * 根目录示例：使用 aipack-compression + DeepSeek 模型实现多级上下文压缩
+ * 根目录示例：使用 aipack-compression + DeepSeek 模型实现上下文压缩
  *
- * 演示五级渐进式降级：
- *   L1: ToolOutputTrim       工具输出裁剪（thinking 剥离 + tool_result 裁剪）
- *   L2: MessageSummarize     旧消息摘要（Fork Agent 调用真实 DeepSeek）
- *   L3: TaskStateExtraction  任务状态提取（结构化 JSON）
- *   L4: SessionCheckpoint     会话检查点（持久化 + 激进缩减）
- *   L5: NewSessionHandoff    新会话交接（保底重置）
+ * 演示 v2 策略管道：
+ *   trim:      无损裁剪（thinking 剥离 + tool_result 按 token 预算裁剪）
+ *   summarize: 旧消息摘要（Fork Agent 调用真实 DeepSeek，超预算时 map-reduce）
+ *   truncate:  硬截断保底（按工具对整体丢弃最旧非 pinned 资源）
+ *   lifecycle: 压不下去时发出上下文耗尽事件（交接文档 + 建议新会话 id）
  *
  * 模型配置统一来自 examples/model.config.ts（本地私有，不提交）：
  *   cp examples/model.config.example.ts examples/model.config.ts
@@ -23,7 +22,6 @@ import {
   createRuntime,
   createRequest,
   extractText,
-  createMemorySessionStorage,
   createDefaultTransformers,
 } from '@aipack-ai/agent';
 import type { Model, ContentBlock, Tool } from '@aipack-ai/agent';
@@ -31,6 +29,7 @@ import {
   createCompressionTransformer,
   loadCompressionConfig,
 } from '@aipack-ai/compression';
+import type { ContextExhaustedEvent } from '@aipack-ai/compression';
 import { createLlm, formatModelConfig } from './model.config';
 
 async function main() {
@@ -43,27 +42,35 @@ async function main() {
     ? Number(process.env.DEMO_CONTEXT_WINDOW)
     : realModel.contextWindow;
 
-  const model: Model = { ...realModel, contextWindow: demoContextWindow };
+  // 覆盖窗口时同步压低 maxTokens：v2 预算 = contextWindow - maxTokens - 边距，
+  // 若 maxTokens > contextWindow，有效预算会被吃光（保底为 1 token）
+  const demoMaxTokens = Math.min(
+    realModel.maxTokens,
+    Math.max(256, Math.floor(demoContextWindow / 4)),
+  );
+  const model: Model = { ...realModel, contextWindow: demoContextWindow, maxTokens: demoMaxTokens };
 
   console.log('╔════════════════════════════════════════════════════╗');
-  console.log('║   aipack-compression + DeepSeek 多级压缩演示    ║');
+  console.log('║   aipack-compression + DeepSeek 压缩管道演示    ║');
   console.log('╚════════════════════════════════════════════════════╝');
   console.log(`  模型: ${model.name} (${model.id})`);
   console.log(`  配置: ${formatModelConfig()}`);
   console.log(`  contextWindow: ${model.contextWindow} tokens${demoContextWindow !== realModel.contextWindow ? ` (覆盖自 ${realModel.contextWindow})` : ''}`);
   console.log(`  工具: read_file（返回 30 行内容，约 250 tokens/次）`);
-  console.log(`  预期: 多轮对话后逐步触发 L1 → L2 → L3+ 压缩\n`);
+  console.log(`  预期: 多轮对话后先触发 trim（裁剪工具输出），再触发 summarize（摘要历史）\n`);
 
-  // ── 2. 加载压缩配置 ────────────────────────────────────────────
+  // ── 2. 加载压缩配置（双水位：trigger 高水位触发，target 低水位压到位）──
   const compressionConfig = loadCompressionConfig({
-    l1: { threshold: 0.50, targetRatio: 0.40, toolResultMaxLines: 10, toolResultHeadLines: 3, toolResultTailLines: 3 },
-    l2: { threshold: 0.65, targetRatio: 0.50, protectedRecentCount: 4, minResourcesToCompress: 3 },
-    l3: { threshold: 0.78, targetRatio: 0.40, protectedRecentCount: 3 },
-    l4: { threshold: 0.88, targetRatio: 0.30, minWorkingSet: 2 },
-    l5: { threshold: 0.95 },
+    budget: { triggerRatio: 0.50, targetRatio: 0.40 },
+    trim: { toolResultMaxTokens: 200, toolResultHeadLines: 3, toolResultTailLines: 3 },
+    summarize: { minResourcesToCompress: 3, protectedRecentCount: 4 },
   });
 
-  console.log(`  配置: L1>${(compressionConfig.l1.threshold * 100).toFixed(0)}% L2>${(compressionConfig.l2.threshold * 100).toFixed(0)}% L3>${(compressionConfig.l3.threshold * 100).toFixed(0)}% L4>${(compressionConfig.l4.threshold * 100).toFixed(0)}% L5>${(compressionConfig.l5.threshold * 100).toFixed(0)}%\n`);
+  const effective = model.contextWindow - model.maxTokens
+    - Math.floor(model.contextWindow * compressionConfig.budget.safetyMarginRatio);
+  console.log(`  水位: trigger>${(compressionConfig.budget.triggerRatio * 100).toFixed(0)}%` +
+    ` target=${(compressionConfig.budget.targetRatio * 100).toFixed(0)}%` +
+    ` (有效预算 ~${effective} tokens)\n`);
 
   // ── 3. 创建压缩转换器 ───────────────────────────────────────────
   // streamFn 复用统一配置，Fork Agent 也会调用真实模型生成摘要
@@ -71,8 +78,13 @@ async function main() {
     config: compressionConfig,
     model,
     streamFn,
-    sessionStorage: createMemorySessionStorage(),
     contextWindow: model.contextWindow,
+  });
+
+  // 上下文耗尽事件：pinned/保护区本身超限时触发（检查点/换会话由 host 决策）
+  let exhaustedEvent: ContextExhaustedEvent | null = null;
+  compressionTransformer.onContextExhausted((e) => {
+    exhaustedEvent = e;
   });
 
   // ── 4. 创建 Runtime ─────────────────────────────────────────────
@@ -141,9 +153,11 @@ async function main() {
       console.log(`  压缩产物: ${markers.join(', ')}`);
     }
 
-    // 如果触发了 L5 交接，停止循环
-    if (markers.includes('L5-Handoff')) {
-      console.log('\n  ⚡ L5 会话交接已触发，演示完成。');
+    // 上下文耗尽（压不下去）→ 打印交接文档摘要并停止
+    if (exhaustedEvent) {
+      const ev = exhaustedEvent as ContextExhaustedEvent;
+      console.log(`\n  ⚡ 上下文耗尽事件（${ev.reason}），建议新会话: ${ev.suggestedSessionId}`);
+      console.log(`  交接文档 (${ev.fallback ? 'fallback' : 'fork 生成'}):\n${ev.handoffDocument.slice(0, 400)}`);
       break;
     }
   }
@@ -217,33 +231,17 @@ function estimateTokens(text: string): number {
 
 function detectCompressionArtifacts(messages: any[]): string[] {
   const markers: string[] = [];
-  const hasCompaction = messages.some(m => {
-    const r = m.role;
+  const hasSummary = messages.some(m => m.role === 'compactionSummary');
+  const hasTrimmed = messages.some(m => {
     const c = m.content;
-    const text = typeof m === 'string' ? m : typeof c === 'string' ? c : '';
-    return r === 'compactionSummary' || text.includes('Context Summary');
+    const text = typeof m === 'string' ? m
+      : typeof c === 'string' ? c
+      : Array.isArray(c) ? c.map((b: any) => b?.text ?? '').join('')
+      : '';
+    return text.includes('[... truncated');
   });
-  const hasTaskState = messages.some(m => {
-    const r = m.role;
-    const c = m.content;
-    const text = typeof m === 'string' ? m : typeof c === 'string' ? c : '';
-    return r === 'taskState' || text.includes('originalRequest');
-  });
-  const hasCheckpoint = messages.some(m => {
-    const c = m.content;
-    const text = typeof m === 'string' ? m : typeof c === 'string' ? c : '';
-    return text.includes('Session Checkpoint');
-  });
-  const hasHandoff = messages.some(m => {
-    const c = m.content;
-    const text = typeof m === 'string' ? m : typeof c === 'string' ? c : '';
-    return text.includes('Session Handoff');
-  });
-
-  if (hasCompaction) markers.push('L2-Summary');
-  if (hasTaskState) markers.push('L3-TaskState');
-  if (hasCheckpoint) markers.push('L4-Checkpoint');
-  if (hasHandoff) markers.push('L5-Handoff');
+  if (hasTrimmed) markers.push('Trim');
+  if (hasSummary) markers.push('Summarize');
   return markers;
 }
 

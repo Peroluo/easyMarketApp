@@ -1,40 +1,40 @@
 /**
- * Token 估算器 - 轻量字符启发式，零依赖
+ * TokenMeter - token 计量
  *
- * P1#5 修复：
- *  - 新增 TokenizerLike 接口，允许注入真实 tokenizer（tiktoken 等）
- *  - CharHeuristicEstimator 维护 "actualTokens / estimatedTokens" 校准比例，
- *    由 recordActualUsage 回填，后续估算按比例修正
- *  - estimateAllDelta 增量接口：基于上次快照做 delta，避免全量 reduce
+ * 计量是所有压缩决策的地基，本实现解决旧 CharHeuristicEstimator 的四个问题：
+ *
+ * 1. 缓存正确性：旧实现以 resource.id 为缓存 key、靠散布各处的手动 invalidate()
+ *    保正确（曾因此出现"截断循环永不生效"的事故）。新实现：
+ *      - string content：按 (id, content.length) 校验，长度变化即失效；
+ *        trim/normalize/替换等不可变更新全部改变长度，无需手动失效
+ *      - 数组/对象 content：按 content 引用（WeakMap）校验，引用变化即失效
+ * 2. 对象 content：旧实现 extractTextFromResource 对对象返回 ''，
+ *    导致 compaction_summary（Message 对象）与 tool_call（args 对象）被估为 0 token。
+ *    新实现对对象 content 用 JSON 序列化文本近似。
+ * 3. 图片 token：旧实现 JSON.stringify 整个 content 后嗅探 "type":"image"（性能差，
+ *    且每个图片固定 1500）。新实现仅扫描 ContentBlock[] 中的 image 块，块数可配置。
+ * 4. 校准闭环：recordActualUsage 以前是死代码。ForkRunner 每次 fork 拿到真实
+ *    usage.input 后自动回填，EMA 平滑修正系统性偏差。
+ *
+ * 真实 tokenizer 仍可注入（TokenizerLike），注入后启发式仅作 fallback。
  */
 
-import type { ContextResource } from '@aipack-ai/agent';
-import { extractTextFromResource } from '@aipack-ai/agent';
+import type { ContextResource, ContentBlock } from '@aipack-ai/agent';
 
 // ─── 接口 ─────────────────────────────────────────────────────────
 
 export interface TokenEstimator {
   estimate(resource: ContextResource): number;
   estimateAll(resources: ContextResource[]): number;
-  /** 使缓存失效（内容变更后调用） */
+  /** 纯文本估算（fork prompt 构建等场景） */
+  estimateText(text: string): number;
+  /** 使缓存失效（新缓存自带失效校验，一般无需调用） */
   invalidate(resourceId?: string): void;
   /**
-   * P1#5: 增量估算。基于上一次快照做 delta，避免长会话下全量 reduce。
-   * 返回新的快照，调用方应保存以便下次传入。
-   */
-  estimateAllDelta?(resources: ContextResource[], snapshot?: EstimationSnapshot): { tokens: number; snapshot: EstimationSnapshot };
-  /**
-   * P1#5: 用真实 usage 回填校准比例。
-   * @param estimated 估算值
-   * @param actual 真实 token 数
+   * 用真实 usage 回填校准比例（EMA 平滑）。
+   * ForkRunner 在每次 fork 完成后自动调用。
    */
   recordActualUsage?(estimated: number, actual: number): void;
-}
-
-export interface EstimationSnapshot {
-  /** resource.id -> estimated tokens 的缓存副本 */
-  ids: string[];
-  total: number;
 }
 
 /** 可注入的真实 tokenizer（如 tiktoken） */
@@ -42,7 +42,7 @@ export interface TokenizerLike {
   encode(text: string): number[] | Uint32Array;
 }
 
-// ─── LRU 缓存 ─────────────────────────────────────────────────────
+// ─── LRU（仅用于 string 缓存的容量上限） ───────────────────────────
 
 class LruCache<K, V> {
   private map = new Map<K, V>();
@@ -50,7 +50,6 @@ class LruCache<K, V> {
 
   get(key: K): V | undefined {
     if (!this.map.has(key)) return undefined;
-    // 重新插入以刷新顺序
     const value = this.map.get(key)!;
     this.map.delete(key);
     this.map.set(key, value);
@@ -73,69 +72,156 @@ class LruCache<K, V> {
   clear(): void {
     this.map.clear();
   }
-
-  get size(): number {
-    return this.map.size;
-  }
 }
 
-// ─── 字符启发式实现 ───────────────────────────────────────────────
+// ─── 实现 ─────────────────────────────────────────────────────────
 
-export class CharHeuristicEstimator implements TokenEstimator {
-  private cache: LruCache<string, number>;
-  /** P1#5: 真实用量校准比例（actualTokens / estimatedTokens 的滑动平均） */
+export class TokenMeter implements TokenEstimator {
+  /** string content 缓存：id → { content 长度, 未校准 token } */
+  private strCache: LruCache<string, { len: number; tokens: number }>;
+  /** 数组/对象 content 缓存：content 引用 → 未校准 token（引用即指纹） */
+  private refCache = new WeakMap<object, number>();
+  /** 真实 / 估算 比例（EMA 平滑），读时应用 */
   private calibrationRatio = 1;
   private calibrationSamples = 0;
-  /** P1#5: 可选真实 tokenizer */
   private tokenizer?: TokenizerLike;
+  private readonly charsPerTokenAscii: number;
+  private readonly charsPerTokenCJK: number;
+  private readonly imageTokensPerBlock: number;
 
-  constructor(
-    private charsPerTokenAscii = 4,
-    private charsPerTokenCJK = 1.5,
-    cacheCapacity = 1000,
-    tokenizer?: TokenizerLike,
-  ) {
-    this.cache = new LruCache<string, number>(Math.max(1, cacheCapacity));
-    this.tokenizer = tokenizer;
+  constructor(options: {
+    charsPerTokenAscii?: number;
+    charsPerTokenCJK?: number;
+    imageTokensPerBlock?: number;
+    cacheCapacity?: number;
+    tokenizer?: TokenizerLike;
+  } = {}) {
+    this.charsPerTokenAscii = options.charsPerTokenAscii ?? 4;
+    this.charsPerTokenCJK = options.charsPerTokenCJK ?? 1.5;
+    this.imageTokensPerBlock = options.imageTokensPerBlock ?? 1500;
+    this.strCache = new LruCache<string, { len: number; tokens: number }>(
+      Math.max(1, options.cacheCapacity ?? 1000),
+    );
+    this.tokenizer = options.tokenizer;
   }
 
   estimate(resource: ContextResource): number {
-    const cached = this.cache.get(resource.id);
-    if (cached !== undefined) return Math.ceil(cached * this.calibrationRatio);
-
-    const text = extractTextFromResource(resource);
-
-    // P1#5: 优先用真实 tokenizer
-    let textTokens: number;
-    if (this.tokenizer) {
-      try {
-        textTokens = this.tokenizer.encode(text).length;
-      } catch {
-        textTokens = this.heuristicEstimate(text);
-      }
-    } else {
-      textTokens = this.heuristicEstimate(text);
-    }
-
-    // 图片 token 估算
-    let imageTokens = 0;
-    try {
-      const contentStr = typeof resource.content === 'string'
-        ? resource.content
-        : JSON.stringify(resource.content);
-      if (contentStr.includes('"type":"image"') || contentStr.includes('"type": "image"')) {
-        imageTokens = 1500;
-      }
-    } catch {
-      // ignore
-    }
-
-    const total = textTokens + imageTokens;
-    this.cache.set(resource.id, total);
-    return Math.ceil(total * this.calibrationRatio);
+    const raw = this.estimateRaw(resource);
+    return Math.ceil(raw * this.calibrationRatio);
   }
 
-  private heuristicEstimate(text: string): number {
+  estimateAll(resources: ContextResource[]): number {
+    let sum = 0;
+    for (const r of resources) sum += this.estimate(r);
+    return sum;
+  }
+
+  estimateText(text: string): number {
+    return Math.ceil(this.heuristic(text) * this.calibrationRatio);
+  }
+
+  invalidate(resourceId?: string): void {
+    if (resourceId) this.strCache.delete(resourceId);
+    else this.strCache.clear();
+  }
+
+  /**
+   * 用真实 usage 回填校准比例。EMA（alpha=0.3）平滑，过滤 5 倍以上噪声。
+   */
+  recordActualUsage(estimated: number, actual: number): void {
+    if (estimated <= 0 || actual <= 0) return;
+    const ratio = actual / estimated;
+    if (ratio > 5 || ratio < 0.2) return;
+    if (this.calibrationSamples === 0) {
+      this.calibrationRatio = ratio;
+    } else {
+      this.calibrationRatio = this.calibrationRatio * 0.7 + ratio * 0.3;
+    }
+    this.calibrationSamples++;
+  }
+
+  // ─── 内部 ───────────────────────────────────────────────────────
+
+  /** 未校准估算，带契约安全缓存 */
+  private estimateRaw(resource: ContextResource): number {
+    const content = resource.content;
+
+    // string：按 (id, length) 校验缓存
+    if (typeof content === 'string') {
+      const cached = this.strCache.get(resource.id);
+      if (cached && cached.len === content.length) return cached.tokens;
+      const tokens = this.heuristic(content);
+      this.strCache.set(resource.id, { len: content.length, tokens });
+      return tokens;
+    }
+
+    // 数组（ContentBlock[]）：按引用校验缓存；文本类块 + 图片块分开计
+    if (Array.isArray(content)) {
+      const cached = this.refCache.get(content);
+      if (cached !== undefined) return cached;
+      const tokens =
+        this.heuristic(this.blockText(content)) +
+        this.countImageBlocks(content) * this.imageTokensPerBlock;
+      this.refCache.set(content, tokens);
+      return tokens;
+    }
+
+    // 对象（Message / tool_call args 等）：JSON 序列化近似；按引用校验缓存
+    if (content && typeof content === 'object') {
+      const cached = this.refCache.get(content as object);
+      if (cached !== undefined) return cached;
+      let tokens = 0;
+      try {
+        tokens = this.heuristic(JSON.stringify(content));
+      } catch {
+        tokens = 0;
+      }
+      this.refCache.set(content as object, tokens);
+      return tokens;
+    }
+
+    return 0;
+  }
+
+  private countImageBlocks(content: ContentBlock[]): number {
+    let count = 0;
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as { type?: string }).type === 'image') {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 提取文本类块的文字（text + thinking）。
+   * agent 包的 extractText 只取 text 块——thinking 块的 token 同样计入
+   * 真实上下文，忽略它会导致"剥离 thinking 无收益"的误判。
+   * （兼容 ai 体系 ThinkingContent 的 .thinking 字段名）
+   */
+  private blockText(content: ContentBlock[]): string {
+    let out = '';
+    for (const block of content) {
+      if (block && typeof block === 'object') {
+        const type = (block as { type?: string }).type;
+        if (type === 'text' || type === 'thinking') {
+          const b = block as { text?: string; thinking?: string };
+          out += b.text ?? b.thinking ?? '';
+        }
+      }
+    }
+    return out;
+  }
+
+  private heuristic(text: string): number {
+    if (!text) return 0;
+    if (this.tokenizer) {
+      try {
+        return this.tokenizer.encode(text).length;
+      } catch {
+        // tokenizer 失败退回启发式
+      }
+    }
     let asciiChars = 0;
     let cjkChars = 0;
     for (const ch of text) {
@@ -143,70 +229,13 @@ export class CharHeuristicEstimator implements TokenEstimator {
       else asciiChars++;
     }
     return Math.ceil(asciiChars / this.charsPerTokenAscii)
-         + Math.ceil(cjkChars / this.charsPerTokenCJK);
-  }
-
-  estimateAll(resources: ContextResource[]): number {
-    return resources.reduce((sum, r) => sum + this.estimate(r), 0);
-  }
-
-  /**
-   * P1#5: 增量估算。基于上一次快照做 delta：
-   *  - 上次存在但本次不存在的 id：减去其 tokens
-   *  - 本次存在但上次不存在的 id：加上其 tokens
-   *  - 两边都存在的 id：若 cache 未变则用旧值
-   */
-  estimateAllDelta(
-    resources: ContextResource[],
-    snapshot?: EstimationSnapshot,
-  ): { tokens: number; snapshot: EstimationSnapshot } {
-    if (!snapshot) {
-      const total = this.estimateAll(resources);
-      return { tokens: total, snapshot: { ids: resources.map(r => r.id), total } };
-    }
-
-    const prevIds = new Set(snapshot.ids);
-    const currentIds = new Set(resources.map(r => r.id));
-
-    // 简化策略：直接全量估算但复用缓存（缓存命中是 O(1)）
-    // 真正的 delta 在缓存命中率高时价值不大；这里提供接口为未来优化留口子
-    const total = resources.reduce((sum, r) => sum + this.estimate(r), 0);
-    return { tokens: total, snapshot: { ids: [...currentIds], total } };
-  }
-
-  /**
-   * P1#5: 用真实 usage 回填校准比例。
-   * 采用 EMA（指数移动平均）平滑，避免单次异常波动。
-   */
-  recordActualUsage(estimated: number, actual: number): void {
-    if (estimated <= 0 || actual <= 0) return;
-    const ratio = actual / estimated;
-    // 过滤异常值（ratio 偏离 5 倍以上视为噪声）
-    if (ratio > 5 || ratio < 0.2) return;
-    if (this.calibrationSamples === 0) {
-      this.calibrationRatio = ratio;
-    } else {
-      // EMA: alpha = 0.3
-      this.calibrationRatio = this.calibrationRatio * 0.7 + ratio * 0.3;
-    }
-    this.calibrationSamples++;
-  }
-
-  invalidate(resourceId?: string): void {
-    if (resourceId) {
-      this.cache.delete(resourceId);
-    } else {
-      this.cache.clear();
-    }
+      + Math.ceil(cjkChars / this.charsPerTokenCJK);
   }
 }
 
 /** 工厂函数 */
 export function createTokenEstimator(
-  charsPerTokenAscii = 4,
-  charsPerTokenCJK = 1.5,
-  cacheCapacity = 1000,
-  tokenizer?: TokenizerLike,
+  options: ConstructorParameters<typeof TokenMeter>[0] = {},
 ): TokenEstimator {
-  return new CharHeuristicEstimator(charsPerTokenAscii, charsPerTokenCJK, cacheCapacity, tokenizer);
+  return new TokenMeter(options);
 }

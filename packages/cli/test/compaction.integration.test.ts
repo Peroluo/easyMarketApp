@@ -1,11 +1,11 @@
 /**
- * 集成测试：五级压缩降级链（CLI 组装方式）
+ * 集成测试：压缩策略管道降级链（CLI 组装方式）
  *
  * 验证 builder.ts 的组装逻辑与 runtime 降级链协作：
- *   L1-L5 五级压缩 transformer → runtime 内置摘要压缩 → 硬截断
+ *   v2 策略管道 transformer（trim → summarize → truncate）→ runtime 内置摘要压缩 → 硬截断
  *
  * 用 mock StreamFn + 小 contextWindow 模型驱动真实 runtime 循环，
- * 通过 telemetryReporter 观测各级触发，不依赖真实 API。
+ * 通过 telemetryReporter 观测各阶段触发，不依赖真实 API。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -97,7 +97,7 @@ test('T1: 默认启用压缩 — buildRuntime 返回 compressionTransformer', as
     args: baseArgs({ sessionDir: path.join(dir, 'sessions') }),
     cwd: dir,
   });
-  assert.ok(built.compressionTransformer, '默认应构造五级压缩 transformer');
+  assert.ok(built.compressionTransformer, '默认应构造压缩 transformer');
   assert.equal(built.runtime.compact === undefined, false, 'runtime 应有 compact 方法');
 });
 
@@ -136,16 +136,17 @@ test('T3: --compaction-config 文件覆盖配置；坏文件仅告警不阻塞',
   assert.ok(built2.compressionTransformer, '坏配置文件不应阻塞 transformer 构造');
 });
 
-// ─── T4：降级链端到端（五级 transformer 在 runtime 循环中触发）───
+// ─── T4：降级链端到端（策略管道 transformer 在 runtime 循环中触发）───
 
-test('T4: 长会话驱动 L1/L2 触发，telemetry 记录降级链', async () => {
+test('T4: 长会话驱动 summarize 触发，telemetry 记录降级链', async () => {
   const reported: CompressionTelemetry[] = [];
   const reporter = { report: (t: CompressionTelemetry) => { reported.push(t); } };
 
-  // 低阈值确保少量轮次即触发；protectedRecentCount=0 验证"全量可压"语义
+  // 低水位阈值确保少量轮次即触发；protectedRecentCount=0 验证"全量可压"语义。
+  // outputReserveTokens=0：mock 模型 maxTokens(2048) > contextWindow(1000)，不预留
   const config = loadCompressionConfig({
-    l1: { threshold: 0.05 },
-    l2: { threshold: 0.08, protectedRecentCount: 0, minResourcesToCompress: 2 },
+    budget: { outputReserveTokens: 0, safetyMarginRatio: 0, triggerRatio: 0.05, targetRatio: 0.02 },
+    summarize: { minResourcesToCompress: 2, protectedRecentCount: 0, forkMaxTokens: 100 },
   });
 
   const transformer = createCompressionTransformer({
@@ -166,10 +167,10 @@ test('T4: 长会话驱动 L1/L2 触发，telemetry 记录降级链', async () =>
 
   await runTurns(runtime, 'it-l2', 3);
 
-  const levels = new Set(reported.map(t => t.level));
-  assert.ok(levels.has('L2'),
-    `应触发 L2 摘要（实际: ${[...levels].join(',') || '无'}）`);
-  // L2 摘要后 token 应净下降
+  const stages = new Set(reported.map(t => t.stage));
+  assert.ok(stages.has('summarize'),
+    `应触发 summarize 摘要（实际: ${[...stages].join(',') || '无'}）`);
+  // 摘要后 token 应净下降
   const compressed = reported.filter(t => t.afterTokens < t.beforeTokens);
   assert.ok(compressed.length > 0, '应存在 token 净下降的压缩记录');
 });

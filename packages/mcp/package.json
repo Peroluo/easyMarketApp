@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/mcp",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "description": "aipack MCP 插件：连接外部 MCP Server（客户端方向）并把其工具包装为原生 Tool，零运行时依赖",
   "type": "module",
   "main": "./dist/index.js",

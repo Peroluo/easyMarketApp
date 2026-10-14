@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/observability-server",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "description": "aipack 可观测性收集服务(S2)：接收 SDK 埋点上报,MySQL/ClickHouse 落盘 + 内存聚合 + REST 查询",
   "type": "module",
   "main": "./dist/index.js",

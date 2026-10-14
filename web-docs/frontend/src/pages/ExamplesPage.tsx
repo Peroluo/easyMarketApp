@@ -75,11 +75,11 @@ export default function ExamplesPage() {
       {/* 3. 上下文压缩 */}
       <div id="compression" style={{ scrollMarginTop: 100 }}>
         <h2 className="subsection-title">
-          <AimOutlined /> 五级上下文压缩（长对话防炸 Token）
+          <AimOutlined /> 策略管道上下文压缩（长对话防炸 Token）
         </h2>
         <p style={{ lineHeight: 1.8, color: '#475569' }}>
           在长对话 / 大工具输出的场景下，Token 很容易超出模型窗口。
-          compression 包提供 5 层渐进式压缩策略，对调用方透明。
+          compression 包提供统一预算下的策略管道（trim → summarize → truncate），对调用方透明。
           动态 import 方式确保不使用时不会被打包。
         </p>
         <CodeBlock code={exCompressionCode} />

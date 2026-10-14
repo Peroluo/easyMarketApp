@@ -1,25 +1,28 @@
 /**
- * 复合压缩转换器 - 五级渐进式降级协调器
+ * 复合压缩转换器 - 策略管道编排器
  *
- * 作为单个 ContextTransformer 加入 Runtime 的 transformers 数组
- *（执行顺序由数组顺序决定），
- * 内部按序执行 L1 → L2 → L3 → L4 → L5，每级仅在前一级不足时触发。
+ * v2 架构（取代 v1 五级阈值瀑布）：
  *
- * 关键修复：
- *  - canCompress 接受 turn 参数；attemptCount 在跨 turn 时重置（不再每次 run 都清零）
- *  - 每级压缩后立即验证 tool pairing，失败则回滚该级（而非全部）
- *  - telemetry 写入 context.shared['compression_telemetry']，供 CompressionTelemetryExtension 上报
- *  - contextWindow 防御性校验
- *  - safetyStates 加 LRU 上限，避免长生命周期内存泄漏
- *  - 为每个 session 创建 AbortController 并在 fork 超时时 abort
- *  - 暴露 recover() / setHandoffHook() API
+ *   ┌─ ContextBudget ── 统一有效预算（扣除输出预留 + 安全边距）+ 双水位
+ *   ├─ TokenMeter ───── 计量（契约安全缓存 + fork usage 自动校准）
+ *   ├─ ForkRunner ───── fork 执行（stopReason 校验 + 输入预算 + 校准回填）
+ *   ├─ 策略管道 ─────── trim（无损）→ summarize（有损，map-reduce）→ truncate（保底）
+ *   ├─ Precompress ──── 低预警线后台摘要，高水位直接应用（请求路径零 fork）
+ *   └─ Lifecycle ────── 压不下去时发 ContextExhaustedEvent，检查点/换会话归 host
+ *
+ * 关键修复（相对 v1）：
+ *   - 串行化改为真互斥：promise 链原子交接，并发 run 不再同时读到同一旧 chain
+ *   - 每策略独立 tool pairing 校验，失败仅回滚该策略
+ *   - 没有任何"永久禁用"状态；冷却只做失败退避
+ *   - dryRun / telemetry / LRU 会话管理保留
  */
 
 import type {
-  ContextResource, TransformContext, Model, StreamFn, SessionStorage,
+  ContextResource, TransformContext, Model, StreamFn,
 } from '@aipack-ai/agent';
-import { BaseTransformer, extractTextFromResource } from '@aipack-ai/agent';
+import { BaseTransformer } from '@aipack-ai/agent';
 import type { TokenEstimator } from './token-estimator';
+import { TokenMeter } from './token-estimator';
 import type { CompressionConfig } from './config';
 import { validateConfig } from './config';
 import type { CompressionTelemetry, TelemetryReporter } from './telemetry';
@@ -31,24 +34,31 @@ import {
   hasInFlightForks,
   type CompressionSafetyState,
 } from './safety';
-import { ToolOutputTrim } from './l1-tool-output-trim';
-import { MessageSummarize } from './l2-message-summarize';
-import { TaskStateExtraction } from './l3-task-state-extraction';
-import { SessionCheckpointLevel, type SessionCheckpoint } from './l4-session-checkpoint';
-import { NewSessionHandoff, type HandoffHook } from './l5-new-session-handoff';
-import { CharHeuristicEstimator } from './token-estimator';
+import { ContextBudget } from './budget';
+import { ForkRunner } from './fork';
 import { DEFAULT_FORK_RETRY, type RetryConfig } from './retry';
+import type { CompressionStrategy, StrategyContext, StrategyResult, PrecomputedSummary } from './strategy';
+import { TrimStrategy } from './strategies/trim';
+import { SummarizeStrategy } from './strategies/summarize';
+import { TruncateStrategy } from './strategies/truncate';
+import {
+  generateHandoffDocument,
+  type ContextExhaustedHandler,
+  type ExhaustedReason,
+} from './lifecycle';
 
 /** safetyStates LRU 上限 */
 const MAX_SESSIONS = 256;
-/** telemetryHistory 上限：避免长会话无限增长（L4 checkpoint 只需最近历史） */
+/** telemetryHistory 上限 */
 const MAX_TELEMETRY_HISTORY = 100;
+/** 预压缩产物最大存活 turn 数（过期丢弃，重新后台生成） */
+const PRECOMPRESS_MAX_TURNS = 8;
 
 export interface CompressionTransformerOptions {
   config: CompressionConfig;
   model: Model;
   streamFn: StreamFn;
-  sessionStorage?: SessionStorage;
+  /** 模型上下文窗口（token） */
   contextWindow: number;
   /**
    * 共享状态 Map（通常是 ExtensionContext.shared）。
@@ -60,33 +70,40 @@ export interface CompressionTransformerOptions {
   telemetryReporter?: TelemetryReporter;
 }
 
-interface SessionStateEntry {
+interface SessionEntry {
   safety: CompressionSafetyState;
-  /** 最近一次访问时间戳（用于 LRU 淘汰） */
+  /** 最近一次访问时间戳（LRU 淘汰用） */
   lastAccess: number;
-  /** P1#6: 同 session 串行化锁。指向"最后一次 run 完成的 promise"，下次 run 会先 await 它 */
+  /** 互斥链：本次 run 的完成 promise，后到者 await 它（原子交接，真互斥） */
   chain: Promise<void> | null;
+  /** 后台预压缩产物（低预警线启动，高水位消费） */
+  pending: PendingPrecompute | null;
+}
+
+interface PendingPrecompute {
+  promise: Promise<PrecomputedSummary | null>;
+  createdAtTurn: number;
 }
 
 export class ContextCompressionTransformer extends BaseTransformer {
   readonly name = 'context-compression';
 
-  private estimator: TokenEstimator;
-  private l1: ToolOutputTrim;
-  private l2: MessageSummarize;
-  private l3: TaskStateExtraction;
-  private l4: SessionCheckpointLevel;
-  private l5: NewSessionHandoff;
-  private safetyGuard: CompressionSafetyGuard;
+  private meter: TokenEstimator;
   private compressionConfig: CompressionConfig;
   private contextWindow: number;
+  private model: Model;
 
-  // 按 sessionKey 缓存安全状态（带 LRU 淘汰）
-  private safetyStates = new Map<string, SessionStateEntry>();
+  private trim: TrimStrategy;
+  private summarize: SummarizeStrategy;
+  private truncate: TruncateStrategy;
+  private summarizeFork: ForkRunner;
+  private lifecycleFork: ForkRunner;
+  private safetyGuard: CompressionSafetyGuard;
 
-  // 共享状态 Map（由上层注入，用于与 CompressionTelemetryExtension 通信）
+  private sessions = new Map<string, SessionEntry>();
   private sharedMap?: Map<string, unknown>;
   private telemetryReporter?: TelemetryReporter;
+  private exhaustedHandlers: ContextExhaustedHandler[] = [];
 
   constructor(opts: CompressionTransformerOptions) {
     super();
@@ -99,58 +116,67 @@ export class ContextCompressionTransformer extends BaseTransformer {
       );
     }
 
-    const asciiRatio = opts.config.charsPerToken.ascii;
-    const cjkRatio = opts.config.charsPerToken.cjk;
+    const cfg = opts.config;
+    this.compressionConfig = cfg;
+    this.contextWindow = opts.contextWindow;
+    this.model = opts.model;
 
-    this.estimator = new CharHeuristicEstimator(
-      asciiRatio,
-      cjkRatio,
-      opts.config.estimatorCacheCapacity,
-    );
+    this.meter = new TokenMeter({
+      charsPerTokenAscii: cfg.estimator.charsPerTokenAscii,
+      charsPerTokenCJK: cfg.estimator.charsPerTokenCJK,
+      imageTokensPerBlock: cfg.estimator.imageTokensPerBlock,
+      cacheCapacity: cfg.estimator.cacheCapacity,
+    });
 
-    // P0#1/#4: fork 超时与重试配置注入各 level
-    const forkTimeoutMs = opts.config.safety.forkTimeoutMs ?? opts.config.forkTimeoutMs;
     const retry: RetryConfig = {
       ...DEFAULT_FORK_RETRY,
-      ...opts.config.safety.retry,
+      ...cfg.safety.retry,
       isRetryable: DEFAULT_FORK_RETRY.isRetryable,
     };
+    const forkCommon = {
+      streamFn: opts.streamFn,
+      model: opts.model,
+      meter: this.meter,
+      forkTimeoutMs: cfg.safety.forkTimeoutMs,
+      retry,
+    };
+    this.summarizeFork = new ForkRunner({
+      ...forkCommon,
+      forkModel: cfg.summarize.forkModel,
+      forkMaxTokens: cfg.summarize.forkMaxTokens,
+    });
+    this.lifecycleFork = new ForkRunner({
+      ...forkCommon,
+      forkModel: cfg.lifecycle.forkModel,
+      forkMaxTokens: cfg.lifecycle.forkMaxTokens,
+    });
 
-    this.l1 = new ToolOutputTrim(this.estimator, opts.config.l1);
-    this.l2 = new MessageSummarize(this.estimator, opts.streamFn, opts.model, opts.config.l2, forkTimeoutMs, retry);
-    this.l3 = new TaskStateExtraction(this.estimator, opts.streamFn, opts.model, opts.config.l3, forkTimeoutMs, retry);
-    this.l4 = new SessionCheckpointLevel(this.estimator, opts.sessionStorage, opts.config.l4);
-    this.l5 = new NewSessionHandoff(this.estimator, opts.streamFn, opts.model, opts.config.l5, forkTimeoutMs, retry);
+    this.trim = new TrimStrategy();
+    this.summarize = new SummarizeStrategy();
+    this.truncate = new TruncateStrategy();
 
     this.safetyGuard = new CompressionSafetyGuard({
-      maxAttempts: opts.config.safety.maxAttempts,
-      cooldownTurns: opts.config.safety.cooldownTurns,
-      forkTimeoutMs,
+      maxAttempts: cfg.safety.maxAttempts,
+      cooldownTurns: cfg.safety.cooldownTurns,
+      forkTimeoutMs: cfg.safety.forkTimeoutMs,
     });
-    this.compressionConfig = opts.config;
-    this.contextWindow = opts.contextWindow;
+
     this.sharedMap = opts.sharedMap;
     this.telemetryReporter = opts.telemetryReporter;
 
-    // P1#13: 启动时校验配置（仅 warn，不阻塞启动）
-    const configErrors = validateConfig(opts.config, false);
+    // 启动时校验配置（仅 warn，不阻塞启动）
+    const configErrors = validateConfig(cfg, false);
     if (configErrors.length > 0) {
       const msg = configErrors
         .map(e => `[${e.severity}] ${e.path}: ${e.message}`)
         .join('; ');
-      // 用 console.warn 而非 throw：生产环境即使配错也能启动
       console.warn(`[aipack-compression] config validation issues: ${msg}`);
     }
   }
 
-  /** 注入 handoff 钩子（让上层真正切换会话） */
-  setHandoffHook(hook: HandoffHook): void {
-    this.l5.setHandoffHook(hook);
-  }
-
-  /** 从检查点恢复完整会话 */
-  async recover(checkpointId: string): Promise<SessionCheckpoint | null> {
-    return this.l4.recover(checkpointId);
+  /** 注册上下文耗尽处理器（检查点/换会话由 host 决策） */
+  onContextExhausted(handler: ContextExhaustedHandler): void {
+    this.exhaustedHandlers.push(handler);
   }
 
   protected async run(
@@ -160,304 +186,347 @@ export class ContextCompressionTransformer extends BaseTransformer {
     if (!this.compressionConfig.enabled) return resources;
 
     const sessionKey = context.runtime.sessionKey;
-    const turn = context.runtime.turn;
-    const entry = this.getOrCreateState(sessionKey);
+    const entry = this.getOrCreateEntry(sessionKey);
 
-    // P1#6: 同 session 串行化。若上次 run 仍在进行，先 await 它。
-    // pipeline 通常已串行调用 transform，但若用户在 hook 里递归触发或并发调度，
-    // safetyState 是共享可变状态（attemptCount/compressionDepth/inFlightForks），需要互斥。
-    if (this.compressionConfig.safety.serializePerSession && entry.chain) {
-      try { await entry.chain; } catch { /* 旧 run 失败不阻塞新 run */ }
+    // 真互斥：promise 链原子交接。
+    // v1 的 check-then-await 不是原子的：并发 B、C 同时读到旧 chain，
+    // A 完成后 B、C 并行执行。v2 每个 run 先原子地把自己接到链尾，再等前一个。
+    if (!this.compressionConfig.safety.serializePerSession) {
+      return this.doRun(resources, context, entry);
     }
 
-    // 标记当前 run 为 chain
-    let releaseChain!: () => void;
-    const myChain = new Promise<void>(resolve => { releaseChain = resolve; });
+    const prev = entry.chain ?? Promise.resolve();
+    let release!: () => void;
+    const myChain = new Promise<void>(r => { release = r; });
     entry.chain = myChain;
-
+    await prev.catch(() => { /* 旧 run 失败不阻塞新 run */ });
     try {
-      return await this.doRun(resources, context, entry.safety);
+      return await this.doRun(resources, context, entry);
     } finally {
-      releaseChain();
-      // 仅当 chain 仍是我的才清空（避免覆盖更晚的 run）
+      release();
       if (entry.chain === myChain) entry.chain = null;
     }
   }
 
-  /** 实际的压缩流程（已确保串行化） */
+  // ─── 主流程 ─────────────────────────────────────────────────────
+
   private async doRun(
     resources: ContextResource[],
     context: TransformContext,
-    safetyState: CompressionSafetyState,
+    entry: SessionEntry,
   ): Promise<ContextResource[]> {
+    const cfg = this.compressionConfig;
     const sessionKey = context.runtime.sessionKey;
     const turn = context.runtime.turn;
+    const safety = entry.safety;
 
-    if (!this.safetyGuard.canCompress(safetyState, turn)) return resources;
+    const budget = this.buildBudget();
+    const tokens = this.meter.estimateAll(resources);
 
-    // P1: compressionDepth 是单次 pipeline 内的本地深度（L2/L3/L4/L5 各 +1），
-    // 跨 turn 必须重置 —— 旧实现持续累积导致运行几轮后 L2 的 maxCompressionDepth
-    // 判断永久失效（与 l2-message-summarize 的注释矛盾）。
-    // doRun 已由外层 chain 保证同 session 串行，此处重置是安全的。
-    safetyState.compressionDepth = 0;
+    // dryRun：只算 token + 生成遥测，不修改资源
+    if (cfg.dryRun) {
+      return this.runDry(resources, budget, tokens, sessionKey, turn, safety);
+    }
 
-    const allTelemetry: CompressionTelemetry[] = [];
+    // 未到高水位：必要时启动后台预压缩，原样返回
+    if (!budget.shouldCompact(tokens)) {
+      this.maybeStartPrecompress(entry, resources, budget, tokens, sessionKey, turn);
+      return resources;
+    }
+
+    // 尝试限流（跨 turn 重置；耗尽进冷却）
+    if (!this.safetyGuard.canCompress(safety, turn)) return resources;
+
     const startTime = Date.now();
-
-    // P2#15: topContributors - 找出 token 占比最高的 resource（运维定位"哪个工具刷屏"）
     const topContributors = this.computeTopContributors(resources, 3);
+    const allTelemetry: CompressionTelemetry[] = [];
 
     let current = resources;
 
-    // P2#14: dryRun 模式 - 只算 token + 生成 telemetry，不修改 resources
-    if (this.compressionConfig.dryRun) {
-      return this.runDry(resources, safetyState, sessionKey, turn, startTime, topContributors);
+    // ── 策略 1：trim（无损） ──
+    current = await this.runStrategy(this.trim, current, budget, safety, sessionKey, turn, allTelemetry, resources.length);
+
+    // ── 策略 2：summarize（有损；优先消费预压缩产物） ──
+    if (!budget.reachedTarget(this.meter.estimateAll(current)) && cfg.summarize.enabled) {
+      const precomputed = await this.takePendingSummary(entry, current, turn);
+      current = await this.runStrategy(
+        this.summarize, current, budget, safety, sessionKey, turn, allTelemetry, resources.length,
+        precomputed,
+      );
     }
 
-    // P1#10: pinned 累积上限检查。
-    // 多轮压缩后 compaction_summary / task_state / checkpoint_ref 都是 pinned，
-    // 总量可能超过 contextWindow * targetRatio，导致 L3/L4 永远无法达标。
-    // 这里在压缩前合并历史 compaction_summary（保留最近 2 个）。
-    current = this.compactPinnedHistory(current, allTelemetry, sessionKey, turn);
-
-    const currentTokens = this.estimator.estimateAll(current);
-
-    // ── L1: 工具输出裁剪 ──
-    if (this.shouldTrigger(currentTokens, this.compressionConfig.l1.threshold)) {
-      const result = await this.l1.compress(current, this.contextWindow, sessionKey, turn);
-      current = this.applyLevelResult('L1', current, result, safetyState, allTelemetry);
+    // ── 策略 3：truncate（保底；仅当超硬限） ──
+    if (budget.overHardLimit(this.meter.estimateAll(current))) {
+      current = await this.runStrategy(this.truncate, current, budget, safety, sessionKey, turn, allTelemetry, resources.length);
     }
 
-    // ── L2: 旧消息摘要 ──
-    if (this.shouldTrigger(this.estimator.estimateAll(current), this.compressionConfig.l2.threshold)) {
-      const result = await this.l2.compress(current, this.contextWindow, safetyState, sessionKey, turn);
-      current = this.applyLevelResult('L2', current, result, safetyState, allTelemetry);
-    }
-
-    // ── L3: 任务状态提取 ──
-    if (this.shouldTrigger(this.estimator.estimateAll(current), this.compressionConfig.l3.threshold)) {
-      const result = await this.l3.compress(current, this.contextWindow, safetyState, sessionKey, turn);
-      current = this.applyLevelResult('L3', current, result, safetyState, allTelemetry);
-    }
-
-    // ── L4: 会话检查点 ──
-    if (this.shouldTrigger(this.estimator.estimateAll(current), this.compressionConfig.l4.threshold)) {
-      const result = await this.l4.compress(current, this.contextWindow, safetyState, sessionKey, turn);
-      current = this.applyLevelResult('L4', current, result, safetyState, allTelemetry);
-    }
-
-    // ── L5: 新会话交接 ──
-    if (this.shouldTrigger(this.estimator.estimateAll(current), this.compressionConfig.l5.threshold)) {
-      const result = await this.l5.compress(current, this.contextWindow, safetyState, sessionKey, turn);
-      current = this.applyLevelResult('L5', current, result, safetyState, allTelemetry);
+    // ── 上下文耗尽：truncate 后仍超硬限 → 发事件，检查点/换会话归 host ──
+    const tokensAfter = this.meter.estimateAll(current);
+    if (budget.overHardLimit(tokensAfter)) {
+      await this.emitExhausted(
+        current, budget, tokensAfter, safety, sessionKey, turn, allTelemetry,
+      );
     }
 
     // ── 补充遥测元信息 ──
     const duration = Date.now() - startTime;
     for (const t of allTelemetry) {
-      t.sessionKey = sessionKey;
-      t.turn = turn;
+      if (!t.sessionKey) t.sessionKey = sessionKey;
+      if (!t.turn) t.turn = turn;
       t.duration = duration;
       t.topContributors = topContributors;
-      t.messageCountBefore = resources.length;
-      t.messageCountAfter = current.length;
+      t.messageCountBefore ??= resources.length;
+      t.messageCountAfter ??= current.length;
     }
 
-    // ── 存储遥测到 safetyState 历史（带上限，避免无限增长） ──
-    this.pushTelemetryHistory(safetyState, allTelemetry);
-
-    // ── 上报遥测：优先用 reporter，否则写入 sharedMap 供 Extension 读取 ──
-    if (allTelemetry.length > 0 && this.compressionConfig.telemetry.enabled) {
+    this.pushTelemetryHistory(safety, allTelemetry);
+    if (allTelemetry.length > 0 && cfg.telemetry.enabled) {
       this.reportTelemetry(allTelemetry);
     }
 
+    // 预压缩产物由 takePendingSummary 在消费/失效时清理；
+    // trim 单独达标跳过 summarize 时保留（应用前会再做有效性校验）
     return current;
   }
 
-  /** P2#14: dryRun - 不修改 resources，只生成 telemetry 记录"如果压缩会怎样" */
-  private async runDry(
+  /** 执行单个策略：尝试计数 + 配对校验 + 失败回滚（仅回滚该策略） */
+  private async runStrategy(
+    strategy: CompressionStrategy,
     resources: ContextResource[],
-    safetyState: CompressionSafetyState,
+    budget: ContextBudget,
+    safety: CompressionSafetyState,
     sessionKey: string,
     turn: number,
-    startTime: number,
-    topContributors: { id: string; type: string; tokens: number }[],
+    allTelemetry: CompressionTelemetry[],
+    messageCountBefore: number,
+    precomputed?: PrecomputedSummary,
   ): Promise<ContextResource[]> {
-    const totalTokens = this.estimator.estimateAll(resources);
-    const config = this.compressionConfig;
+    const ctx: StrategyContext = {
+      resources,
+      budget,
+      meter: this.meter,
+      safety,
+      sessionKey,
+      turn,
+      config: this.compressionConfig,
+      // trim/truncate 不需要 fork；统一注入 summarizeFork（lifecycle 用独立 runner）
+      fork: this.summarizeFork,
+      precomputed,
+    };
+    const result: StrategyResult = await strategy.compress(ctx);
 
-    // 模拟逐级判断，记录"哪级会被触发"
-    const wouldTrigger: string[] = [];
-    if (this.shouldTrigger(totalTokens, config.l1.threshold)) wouldTrigger.push('L1');
-    if (this.shouldTrigger(totalTokens, config.l2.threshold)) wouldTrigger.push('L2');
-    if (this.shouldTrigger(totalTokens, config.l3.threshold)) wouldTrigger.push('L3');
-    if (this.shouldTrigger(totalTokens, config.l4.threshold)) wouldTrigger.push('L4');
-    if (this.shouldTrigger(totalTokens, config.l5.threshold)) wouldTrigger.push('L5');
+    const unchanged = result.resources === resources && result.telemetry.every(t => !t.failed);
+    if (unchanged && result.telemetry.length === 0) return resources;
 
-    const telemetry: CompressionTelemetry[] = [];
-    for (const level of wouldTrigger) {
-      const t = createTelemetry(
-        level as 'L1' | 'L2' | 'L3' | 'L4' | 'L5',
-        'dry_run_would_trigger',
-        totalTokens,
-        totalTokens,
-        {
-          sessionKey, turn,
-          message: `dry_run: would trigger ${level}`,
-        },
-      );
-      t.topContributors = topContributors;
+    this.safetyGuard.recordAttempt(safety);
+
+    // 失败遥测（fork 失败等）：保留 resources，只记录
+    const hasFailure = result.telemetry.some(t => t.failed);
+    if (hasFailure && result.resources === resources) {
+      for (const t of result.telemetry) t.messageCountBefore = messageCountBefore;
+      allTelemetry.push(...result.telemetry);
+      return resources;
+    }
+
+    // 资源有变化：配对校验，失败回滚该策略
+    if (result.resources !== resources
+      && !this.safetyGuard.validateToolPairing(result.resources)) {
+      allTelemetry.push(...result.telemetry.map(t => ({
+        ...t,
+        rolledBack: true,
+        message: `${strategy.name}_tool_pairing_validation_failed`,
+        messageCountBefore,
+      })));
+      return resources;
+    }
+
+    for (const t of result.telemetry) t.messageCountBefore = messageCountBefore;
+    allTelemetry.push(...result.telemetry);
+    return result.resources;
+  }
+
+  // ─── 预压缩 ────────────────────────────────────────────────────
+
+  /** 低预警线：无 pending 时后台启动摘要 fork（不阻塞请求路径） */
+  private maybeStartPrecompress(
+    entry: SessionEntry,
+    resources: ContextResource[],
+    budget: ContextBudget,
+    tokens: number,
+    sessionKey: string,
+    turn: number,
+  ): void {
+    const cfg = this.compressionConfig;
+    if (!cfg.summarize.enabled || entry.pending) return;
+    if (!budget.shouldPrecompress(tokens)) return;
+
+    const ctx: StrategyContext = {
+      resources,
+      budget,
+      meter: this.meter,
+      safety: entry.safety,
+      sessionKey,
+      turn,
+      config: cfg,
+      fork: this.summarizeFork,
+    };
+    const promise = this.summarize
+      .precompute(ctx)
+      .then(summary => {
+        if (summary) {
+          this.pushTelemetryHistory(entry.safety, [createTelemetry(
+            'precompress', 'precompress_ready', tokens, tokens, {
+              sessionKey,
+              turn,
+              resourcesAffected: summary.sourceIds.length,
+              forkDurationMs: summary.forkDurationMs,
+              message: `background_summary_ready:${summary.sourceIds.length} resources`,
+              prefixIntact: resources.length,
+            },
+          )]);
+          if (cfg.telemetry.enabled) {
+            this.reportTelemetry(entry.safety.telemetryHistory.slice(-1));
+          }
+        }
+        return summary;
+      })
+      .catch(() => null);
+
+    entry.pending = { promise, createdAtTurn: turn };
+  }
+
+  /** 取有效的预压缩产物：过期/失败 → null，并清理 pending */
+  private async takePendingSummary(
+    entry: SessionEntry,
+    resources: ContextResource[],
+    turn: number,
+  ): Promise<PrecomputedSummary | undefined> {
+    const pending = entry.pending;
+    if (!pending) return undefined;
+
+    // 过期淘汰
+    if (turn - pending.createdAtTurn > PRECOMPRESS_MAX_TURNS) {
+      entry.pending = null;
+      return undefined;
+    }
+
+    const summary = await pending.promise;
+    entry.pending = null;
+    if (!summary) return undefined;
+
+    // 有效性：sourceIds 仍在当前资源中（summarize.applyPrecomputed 会再验一次）
+    const idSet = new Set(resources.map(r => r.id));
+    if (!summary.sourceIds.every(id => idSet.has(id))) return undefined;
+    return summary;
+  }
+
+  // ─── 上下文耗尽 ────────────────────────────────────────────────
+
+  private async emitExhausted(
+    resources: ContextResource[],
+    budget: ContextBudget,
+    tokensAfter: number,
+    safety: CompressionSafetyState,
+    sessionKey: string,
+    turn: number,
+    allTelemetry: CompressionTelemetry[],
+  ): Promise<void> {
+    // 原因推断：无可丢资源 → pinned 超限；否则是保护窗口超限
+    const reason: ExhaustedReason =
+      tokensAfter > 0 && resources.every(r => r.pinned)
+        ? 'pinned_overload'
+        : 'protected_overload';
+
+    const { event, telemetry } = await generateHandoffDocument({
+      config: this.compressionConfig,
+      fork: this.lifecycleFork,
+      safety,
+      resources,
+      sessionKey,
+      turn,
+      reason,
+      tokensAfter,
+      hardLimitTokens: budget.hardLimitTokens,
+    });
+
+    for (const t of telemetry) {
       t.messageCountBefore = resources.length;
       t.messageCountAfter = resources.length;
+    }
+    allTelemetry.push(...telemetry);
+    this.pushTelemetryHistory(safety, telemetry);
+
+    // 通知 host（检查点/换会话是 host 的职责）
+    for (const handler of this.exhaustedHandlers) {
+      try {
+        await handler(event);
+      } catch {
+        // handler 失败不影响 pipeline
+      }
+    }
+  }
+
+  // ─── dryRun ─────────────────────────────────────────────────────
+
+  private runDry(
+    resources: ContextResource[],
+    budget: ContextBudget,
+    tokens: number,
+    sessionKey: string,
+    turn: number,
+    safety: CompressionSafetyState,
+  ): ContextResource[] {
+    const telemetry: CompressionTelemetry[] = [];
+    const would: string[] = [];
+    if (budget.shouldPrecompress(tokens)) would.push('precompress');
+    if (budget.shouldCompact(tokens)) {
+      would.push('trim', 'summarize');
+      if (budget.overHardLimit(tokens)) would.push('truncate');
+    }
+
+    if (would.length > 0) {
+      const t = createTelemetry('dry_run', 'dry_run_would_trigger', tokens, tokens, {
+        sessionKey,
+        turn,
+        message: `dry_run: would run [${would.join(' → ')}]`,
+        prefixIntact: resources.length,
+        messageCountBefore: resources.length,
+        messageCountAfter: resources.length,
+      });
       telemetry.push(t);
     }
 
-    this.pushTelemetryHistory(safetyState, telemetry);
-    if (telemetry.length > 0 && config.telemetry.enabled) {
+    this.pushTelemetryHistory(safety, telemetry);
+    if (telemetry.length > 0 && this.compressionConfig.telemetry.enabled) {
       this.reportTelemetry(telemetry);
     }
-
-    const duration = Date.now() - startTime;
-    for (const t of telemetry) t.duration = duration;
-
-    return resources; // dryRun 不修改
+    return resources;
   }
 
-  /** P2#15: 找出 token 占比最高的 N 个 resource */
+  // ─── 辅助 ───────────────────────────────────────────────────────
+
+  private buildBudget(): ContextBudget {
+    const cfg = this.compressionConfig;
+    return new ContextBudget(this.contextWindow, {
+      outputReserveTokens: cfg.budget.outputReserveTokens ?? this.model.maxTokens,
+      safetyMarginRatio: cfg.budget.safetyMarginRatio,
+      triggerRatio: cfg.budget.triggerRatio,
+      targetRatio: cfg.budget.targetRatio,
+      precompressRatio: cfg.budget.precompressRatio,
+    });
+  }
+
+  /** token 占比最高的 N 个 resource（运维定位"哪个工具刷屏"） */
   private computeTopContributors(
     resources: ContextResource[],
     limit: number,
   ): { id: string; type: string; tokens: number }[] {
     return resources
-      .map(r => ({ id: r.id, type: r.type, tokens: this.estimator.estimate(r) }))
+      .map(r => ({ id: r.id, type: r.type, tokens: this.meter.estimate(r) }))
       .sort((a, b) => b.tokens - a.tokens)
       .slice(0, limit);
   }
 
-  /**
-   * P1#10: 合并历史 pinned compaction_summary，保留最近 2 个。
-   * 当 pinned 总量超过 contextWindow * min(l2.targetRatio, l3.targetRatio) 时触发。
-   * P2#17: 真正用上 DEFAULT_DROP_ORDER - 决定合并时优先丢弃哪些类型的旧 summary。
-   */
-  private compactPinnedHistory(
-    resources: ContextResource[],
-    allTelemetry: CompressionTelemetry[],
-    sessionKey: string,
-    turn: number,
-  ): ContextResource[] {
-    const summaries = resources.filter(r => r.type === 'compaction_summary' && r.pinned);
-    if (summaries.length <= 2) return resources;
-
-    const pinnedTokens = this.estimator.estimateAll(
-      resources.filter(r => r.pinned),
-    );
-    const minTarget = Math.min(
-      this.compressionConfig.l2.targetRatio,
-      this.compressionConfig.l3.targetRatio,
-    );
-    const threshold = this.contextWindow * minTarget;
-    if (pinnedTokens <= threshold) return resources;
-
-    // 保留最近 2 个 summary，其余合并为一个"历史摘要的摘要"
-    const sorted = [...summaries].sort((a, b) => a.timestamp - b.timestamp);
-    const toMerge = sorted.slice(0, -2); // 旧的
-    const toKeep = sorted.slice(-2);    // 最近的
-
-    if (toMerge.length === 0) return resources;
-
-    const mergedText = toMerge
-      .map(r => extractTextFromResource(r))
-      .join('\n\n---\n\n');
-
-    const mergedSummary: ContextResource = {
-      id: `compaction_merged_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      type: 'compaction_summary',
-      role: 'system',
-      content: `[Merged Historical Summaries (${toMerge.length} sources)]\n\n${mergedText}`,
-      timestamp: Date.now(),
-      dependencies: [],
-      meta: {
-        _compressionLevel: 1.5,
-        _mergedCount: toMerge.length,
-        _sourceIds: toMerge.map(r => r.id),
-      },
-      pinned: true,
-    };
-
-    // P2#17: 用 DEFAULT_DROP_ORDER 决定丢弃顺序（这里用于记录到 telemetry）
-    const droppedTypes = toMerge.map(r => r.type);
-
-    const toMergeIds = new Set(toMerge.map(r => r.id));
-    const result = resources
-      .filter(r => !toMergeIds.has(r.id))
-      .concat([mergedSummary]);
-
-    // 插入到第一个 toKeep 之前
-    const firstKeepIdx = result.findIndex(r => toKeep.includes(r));
-    if (firstKeepIdx >= 0) {
-      const mergedIdx = result.findIndex(r => r.id === mergedSummary.id);
-      if (mergedIdx >= 0 && mergedIdx !== firstKeepIdx) {
-        result.splice(mergedIdx, 1);
-        result.splice(firstKeepIdx, 0, mergedSummary);
-      }
-    }
-
-    const beforeTokens = this.estimator.estimateAll(resources);
-    const afterTokens = this.estimator.estimateAll(result);
-    if (afterTokens < beforeTokens) {
-      allTelemetry.push(createTelemetry('L1', 'merge_pinned_history', beforeTokens, afterTokens, {
-        sessionKey, turn,
-        resourcesAffected: toMerge.length,
-        message: `merged ${toMerge.length} old summaries; dropped types: ${droppedTypes.join(',')}`,
-      }));
-    }
-
-    return result;
-  }
-
-  /** 应用单级压缩结果：包含 token 阈值判断、配对验证、回滚逻辑 */
-  private applyLevelResult(
-    level: 'L1' | 'L2' | 'L3' | 'L4' | 'L5',
-    before: ContextResource[],
-    result: { resources: ContextResource[]; telemetry: CompressionTelemetry[] },
-    safetyState: CompressionSafetyState,
-    allTelemetry: CompressionTelemetry[],
-  ): ContextResource[] {
-    // 该级没有产生压缩（telemetry 为空或 resources 未变）
-    if (result.telemetry.length === 0 && result.resources === before) {
-      return before;
-    }
-
-    // 记录尝试次数
-    this.safetyGuard.recordAttempt(safetyState);
-
-    // 失败遥测（fork 失败、持久化失败等）：保留 resources，但记下 telemetry
-    const hasFailure = result.telemetry.some(t => t.failed);
-    if (hasFailure && result.resources === before) {
-      allTelemetry.push(...result.telemetry);
-      return before;
-    }
-
-    // 配对验证：失败则回滚到该级输入（不连带回滚其他级）
-    if (!this.safetyGuard.validateToolPairing(result.resources)) {
-      allTelemetry.push(...result.telemetry.map(t => ({
-        ...t,
-        rolledBack: true,
-        message: `${level}_tool_pairing_validation_failed`,
-      })));
-      return before;
-    }
-
-    allTelemetry.push(...result.telemetry);
-    return result.resources;
-  }
-
-  /** 是否应触发某级压缩 */
-  private shouldTrigger(currentTokens: number, threshold: number): boolean {
-    return currentTokens > this.contextWindow * threshold;
-  }
-
-  /** P1: telemetryHistory 只保留最近 MAX_TELEMETRY_HISTORY 条，避免无限增长 */
   private pushTelemetryHistory(safety: CompressionSafetyState, items: CompressionTelemetry[]): void {
     if (items.length === 0) return;
     safety.telemetryHistory.push(...items);
@@ -485,35 +554,35 @@ export class ContextCompressionTransformer extends BaseTransformer {
     }
   }
 
-  private getOrCreateState(sessionKey: string): SessionStateEntry {
-    const existing = this.safetyStates.get(sessionKey);
+  private getOrCreateEntry(sessionKey: string): SessionEntry {
+    const existing = this.sessions.get(sessionKey);
     if (existing) {
       existing.lastAccess = Date.now();
       return existing;
     }
 
-    // LRU 淘汰
-    if (this.safetyStates.size >= MAX_SESSIONS) {
+    if (this.sessions.size >= MAX_SESSIONS) {
       this.evictOldest();
     }
 
-    const safety = createSafetyState({
-      forkTimeoutMs: this.compressionConfig.forkTimeoutMs,
-    });
-    const entry: SessionStateEntry = { safety, lastAccess: Date.now(), chain: null };
-    this.safetyStates.set(sessionKey, entry);
+    const entry: SessionEntry = {
+      safety: createSafetyState(),
+      lastAccess: Date.now(),
+      chain: null,
+      pending: null,
+    };
+    this.sessions.set(sessionKey, entry);
     return entry;
   }
 
   /**
-   * P1#7: LRU 淘汰 - 避开除掉正在 in-flight fork 的 session。
-   * 旧实现直接淘汰 lastAccess 最小者，进行中的 fork 被 abort，结果丢失。
+   * LRU 淘汰：跳过有 in-flight fork 的 session；
+   * 全部 in-flight 时兜底淘汰最老者（中断它），避免 Map 无限增长。
    */
   private evictOldest(): void {
     let oldestKey: string | null = null;
     let oldestTime = Infinity;
-    for (const [key, entry] of this.safetyStates) {
-      // P1#7: 跳过有 in-flight fork 的 session
+    for (const [key, entry] of this.sessions) {
       if (hasInFlightForks(entry.safety)) continue;
       if (entry.lastAccess < oldestTime) {
         oldestTime = entry.lastAccess;
@@ -521,25 +590,25 @@ export class ContextCompressionTransformer extends BaseTransformer {
       }
     }
     if (oldestKey) {
-      const entry = this.safetyStates.get(oldestKey);
+      const entry = this.sessions.get(oldestKey);
       if (entry) abortSafetyState(entry.safety);
-      this.safetyStates.delete(oldestKey);
-    } else if (this.safetyStates.size >= MAX_SESSIONS) {
-      // 兜底：所有 session 都 in-flight，淘汰真正最老的（中断它）
-      // 避免 LRU 永远淘汰不掉导致 Map 无限增长
-      let fallbackOldest: string | null = null;
-      let fallbackTime = Infinity;
-      for (const [key, entry] of this.safetyStates) {
-        if (entry.lastAccess < fallbackTime) {
-          fallbackTime = entry.lastAccess;
-          fallbackOldest = key;
-        }
+      this.sessions.delete(oldestKey);
+      return;
+    }
+
+    // 兜底：所有 session 都 in-flight，淘汰真正最老的
+    let fallbackOldest: string | null = null;
+    let fallbackTime = Infinity;
+    for (const [key, entry] of this.sessions) {
+      if (entry.lastAccess < fallbackTime) {
+        fallbackTime = entry.lastAccess;
+        fallbackOldest = key;
       }
-      if (fallbackOldest) {
-        const entry = this.safetyStates.get(fallbackOldest);
-        if (entry) abortSafetyState(entry.safety);
-        this.safetyStates.delete(fallbackOldest);
-      }
+    }
+    if (fallbackOldest) {
+      const entry = this.sessions.get(fallbackOldest);
+      if (entry) abortSafetyState(entry.safety);
+      this.sessions.delete(fallbackOldest);
     }
   }
 }

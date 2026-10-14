@@ -61,8 +61,8 @@ const featureCards = [
   },
   {
     icon: <DatabaseOutlined />,
-    title: '五级上下文压缩',
-    desc: 'L1 裁剪 → L2 摘要 → L3 状态 → L4 检查点 → L5 交接新会话，长会话不溢出',
+    title: '策略管道上下文压缩',
+    desc: '统一预算双水位调度：trim 无损裁剪 → summarize 摘要 → truncate 保底，长会话不溢出',
   },
 ];
 
@@ -95,7 +95,7 @@ export default function CliPage() {
       </h1>
       <p className="section-subtitle">
         <b>@aipack-ai/cli</b> 基于 aipack 框架的终端 AI 编程助手。内置文件读写、shell、检索与
-        task 子 agent 工具，支持项目记忆文件、Skills、MCP、Hooks 与五级上下文压缩；
+        task 子 agent 工具，支持项目记忆文件、Skills、MCP、Hooks 与策略管道上下文压缩；
         默认权限策略对正常操作零打断、仅危险命令需确认。
       </p>
 
@@ -217,8 +217,9 @@ export default function CliPage() {
           <DatabaseOutlined /> 8. 上下文压缩
         </h2>
         <Paragraph style={{ lineHeight: 1.8, color: '#475569' }}>
-          五级压缩作为 runtime 降级链的第一级（五级压缩 → 内置摘要压缩 → 硬截断兜底），
-          L5 超限后生成交接文档并自动切换新会话。
+          压缩策略管道作为 runtime 降级链的第一级（压缩管道 → 内置摘要压缩 → 硬截断兜底）。
+          统一预算 = contextWindow − 输出预留 − 安全边距；双水位调度：70% 预警时后台预压缩、
+          80% 触发压到 40%。压不下去时发出上下文耗尽事件（交接文档 + 建议新会话，换会话决策归调用方）。
         </Paragraph>
         <CodeBlock code={cliCompactionCode} language="bash" />
       </div>

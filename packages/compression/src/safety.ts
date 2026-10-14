@@ -1,5 +1,11 @@
 /**
- * 安全守卫 - 配对验证、递归保护、断路器、AbortController 管理
+ * 安全守卫 - 配对验证、尝试限流、AbortController 管理
+ *
+ * v2 变化：
+ *   - 移除 handoffCompleted"永久禁用压缩"语义（会话耗尽改由 lifecycle 事件交还 host，
+ *     压缩器不再自我熔断到死）
+ *   - 移除 compressionDepth / checkpointId 等级别瀑布遗留状态
+ *   - canCompress 仅做：每 turn 尝试限流 + 失败后的短冷却退避
  */
 
 import type { ContextResource } from '@aipack-ai/agent';
@@ -8,49 +14,32 @@ import type { CompressionTelemetry } from './telemetry';
 // ─── 安全状态 ─────────────────────────────────────────────────────
 
 export interface CompressionSafetyState {
-  /** 当前 turn 内累计压缩尝试次数（跨 level 累加，跨 turn 重置） */
+  /** 当前 turn 内累计压缩尝试次数（跨策略累加，跨 turn 重置） */
   attemptCount: number;
   /** 上次执行压缩的 turn（用于跨 turn 时重置 attemptCount） */
   lastTurn: number;
-  /**
-   * 单次 pipeline 内的累计压缩深度（L2/L3/L4/L5 触发时 +1）。
-   * 由 transformer 在每次 run 开始时重置为 0 —— 不跨 turn 累积，
-   * 避免运行几轮后 maxCompressionDepth 判断永久失效。
-   */
-  compressionDepth: number;
-  /** 断路器是否已触发 */
-  circuitBreakerTripped: boolean;
-  /** 冷却剩余 turn 数 */
+  /** 冷却剩余 turn 数（尝试耗尽后的失败退避） */
   cooldownRemaining: number;
   /**
    * Session 级 AbortController（仅用于外部主动取消整个 session，
-   * 例如 LRU 淘汰 / 用户中断）。不用于单次 fork 超时。
-   * 单次 fork 超时由 createForkAbortController 管理。
+   * 例如 LRU 淘汰 / 用户中断）。单次 fork 超时由 createForkAbortController 管理。
    */
   sessionAbortController?: AbortController;
   /** 当前是否有 in-flight fork（用于并发安全与 LRU 淘汰保护） */
   inFlightForks: number;
-  /** 是否已创建 checkpoint */
-  hasCheckpoint: boolean;
-  /** 最近一次 checkpoint id */
-  checkpointId?: string;
-  /** 是否已完成 L5 handoff */
-  handoffCompleted: boolean;
-  /** 遥测历史 */
+  /** 遥测历史（带容量上限，见 MAX_TELEMETRY_HISTORY） */
   telemetryHistory: CompressionTelemetry[];
 }
 
 export interface CreateSafetyStateOptions {
-  /** 单次 fork 调用超时（ms），默认 30000；0 表示不自动超时（仍保留主动 abort 能力） */
+  /** 单次 fork 调用超时（ms），默认 30000；0 表示不自动超时 */
   forkTimeoutMs?: number;
 }
 
 export function createSafetyState(
   options?: CreateSafetyStateOptions,
 ): CompressionSafetyState {
-  // sessionAbortController 仅用于"主动取消整个 session"，不启动超时 timer。
-  // 修复 P0#1：原实现在此处启动 setTimeout(forkTimeoutMs) 会在 30s 后永久 abort，
-  // 导致长会话所有后续 fork 全部失败。单次 fork 超时改由 createForkAbortController 管理。
+  void options; // forkTimeoutMs 由 ForkRunner per-fork 管理，此处仅保留接口兼容
   let sessionAbortController: AbortController | undefined;
   try {
     sessionAbortController = new AbortController();
@@ -61,13 +50,9 @@ export function createSafetyState(
   return {
     attemptCount: 0,
     lastTurn: -1,
-    compressionDepth: 0,
-    circuitBreakerTripped: false,
     cooldownRemaining: 0,
     sessionAbortController,
     inFlightForks: 0,
-    hasCheckpoint: false,
-    handoffCompleted: false,
     telemetryHistory: [],
   };
 }
@@ -75,11 +60,8 @@ export function createSafetyState(
 /**
  * 创建一次 fork 调用的 AbortController。
  *
- * 设计：每次 fork 都用独立的 AbortController + 局部 setTimeout，
- * 在 fork 结束时 clearTimeout，避免旧实现"创建 safetyState 时启动 30s timer
- * 永久 abort 整个 session"的致命 bug。
- *
- * 若 state 上有 sessionAbortController，则组合：session 级 abort 也能取消 fork。
+ * 每次 fork 独立 controller + 局部 setTimeout，结束时 clearTimeout。
+ * 若 state 上有 sessionAbortController 则组合：session 级 abort 也能取消 fork。
  * 返回的 cleanup 必须在 finally 中调用。
  */
 export function createForkAbortController(
@@ -134,8 +116,6 @@ export function createForkAbortController(
 
 /**
  * 执行一次 fork 调用，自动管理 AbortController 生命周期与 in-flight 计数。
- * - 自动用 createForkAbortController 创建 per-fork signal
- * - finally 中清理 timer 并递减 inFlightForks
  */
 export async function runFork<T>(
   state: CompressionSafetyState,
@@ -167,7 +147,7 @@ export function hasInFlightForks(state: CompressionSafetyState): boolean {
 export interface SafetyConfig {
   /** 单 turn 内最大压缩尝试次数 */
   maxAttempts: number;
-  /** 触发熔断后冷却 turn 数 */
+  /** 尝试耗尽后冷却 turn 数 */
   cooldownTurns: number;
   /** fork 调用超时（ms） */
   forkTimeoutMs?: number;
@@ -178,28 +158,25 @@ export class CompressionSafetyGuard {
 
   /**
    * 是否允许执行压缩。
-   * @param turn 当前 turn（用于跨 turn 时重置计数）
+   * - 跨 turn 重置尝试计数
+   * - 冷却期间拒绝；冷却结束后恢复
+   * - 单 turn 尝试耗尽 → 进入冷却
+   *
+   * 注意：不再有"永久禁用"。会话级兜底由 lifecycle 耗尽事件交还 host 处理。
    */
   canCompress(state: CompressionSafetyState, turn: number): boolean {
-    if (state.handoffCompleted) return false;
-
     // 跨 turn 边界：重置本 turn 的尝试计数
     if (state.lastTurn !== turn) {
       state.lastTurn = turn;
       state.attemptCount = 0;
     }
 
-    if (state.circuitBreakerTripped) {
-      if (state.cooldownRemaining > 0) {
-        state.cooldownRemaining--;
-        return false;
-      }
-      state.circuitBreakerTripped = false;
-      state.attemptCount = 0;
+    if (state.cooldownRemaining > 0) {
+      state.cooldownRemaining--;
+      return false;
     }
 
     if (state.attemptCount >= this.config.maxAttempts) {
-      state.circuitBreakerTripped = true;
       state.cooldownRemaining = this.config.cooldownTurns;
       return false;
     }
@@ -213,45 +190,29 @@ export class CompressionSafetyGuard {
   }
 
   /**
-   * 验证 tool_call / tool_result 配对完整性。
+   * 验证 tool_call / tool_result 配对完整性（双向）：
+   *  1. 每个 tool_result 的 toolCallId 必须有对应发起方
+   *  2. 每个发起方 toolCallId 必须有对应 tool_result（否则悬空 tool_call）
    *
-   * 修复 P0#3：旧实现只校验"tool_result 的 dep 被引用"，不校验"assistant_message 的
-   * toolCallId 依赖必须有 tool_result"，导致悬空 tool_call 漏检，模型重放时报错。
-   *
-   * 权威标记：`meta.toolCallId`（tool_call / tool_result 必有，assistant_message 可选）。
-   * 回退标记：`dependencies`（在 assistant_message / tool_call 上按框架约定为 toolCallId；
-   *   在 tool_result 上也为 toolCallId；详见 aipack 的 messageToResource）。
-   *
-   * 检查规则（双向）：
-   *  1. 每个 tool_result 的 toolCallId 必须有对应发起方（assistant_message 含该 ToolCallContent
-   *     或 tool_call 资源）
-   *  2. 每个 tool_call / assistant_message.toolCallId 依赖必须有对应 tool_result
-   *  3. resource.meta.toolCallId 与 dependencies 不一致时以 meta 为准
+   * 权威标记：`meta.toolCallId`；回退标记：`dependencies`。
    */
   validateToolPairing(resources: ContextResource[]): boolean {
-    // 收集所有 toolCallId（以 meta.toolCallId 为权威，无则取 dependencies）
-    const initiatorCallIds = new Set<string>();   // assistant_message 发起 + tool_call
-    const resultCallIds = new Set<string>();      // tool_result
+    const initiatorCallIds = new Set<string>();
+    const resultCallIds = new Set<string>();
 
     for (const r of resources) {
       const metaCallId = r.meta?.toolCallId as string | undefined;
 
       if (r.type === 'tool_result') {
-        // 优先 meta.toolCallId；无则取 dependencies[0]（框架约定）
         const callId = metaCallId ?? r.dependencies[0];
         if (callId) resultCallIds.add(callId);
       } else if (r.type === 'tool_call') {
         const callId = metaCallId ?? r.dependencies[0] ?? r.id;
         if (callId) initiatorCallIds.add(callId);
       } else if (r.type === 'assistant_message') {
-        // assistant_message 的 dependencies 在框架约定里就是 toolCallId（messageToResource
-        // 中 builder.dependsOn(tc.id)）；同时支持从 content 提取 ToolCallContent.id。
-        // 若框架设置了 meta.toolCallId 则以此为准（与 tool_call/tool_result 一致）。
-        const metaCallId = r.meta?.toolCallId as string | undefined;
         if (metaCallId) initiatorCallIds.add(metaCallId);
         for (const dep of r.dependencies) initiatorCallIds.add(dep);
-        const fromContent = extractToolCallIdsFromContent(r.content);
-        for (const id of fromContent) initiatorCallIds.add(id);
+        for (const id of extractToolCallIdsFromContent(r.content)) initiatorCallIds.add(id);
       }
     }
 
@@ -260,40 +221,12 @@ export class CompressionSafetyGuard {
       if (!initiatorCallIds.has(callId)) return false;
     }
 
-    // 规则 2：每个发起方 toolCallId 必须有 tool_result（否则悬空 tool_call）
-    // 注：assistant_message 可能只有文本回复（dependencies 为空），无 toolCallId 时跳过
+    // 规则 2：每个发起方必须有 tool_result
     for (const callId of initiatorCallIds) {
       if (!resultCallIds.has(callId)) return false;
     }
 
     return true;
-  }
-
-  /** 验证 message.id 块不可分离性 */
-  validateMessageIntegrity(
-    before: ContextResource[],
-    after: ContextResource[],
-  ): boolean {
-    const beforeGroups = this.groupByMessageId(before);
-    const afterGroups = this.groupByMessageId(after);
-
-    for (const [msgId, group] of afterGroups) {
-      const beforeGroup = beforeGroups.get(msgId);
-      if (beforeGroup && beforeGroup.length !== group.length) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  private groupByMessageId(resources: ContextResource[]): Map<string, ContextResource[]> {
-    const groups = new Map<string, ContextResource[]>();
-    for (const r of resources) {
-      const groupId = (r.meta.toolCallId as string) ?? r.id;
-      if (!groups.has(groupId)) groups.set(groupId, []);
-      groups.get(groupId)!.push(r);
-    }
-    return groups;
   }
 }
 
@@ -322,13 +255,11 @@ export function isToolPairComplete(
   pairMap: Map<string, string[]>,
 ): boolean {
   if (resource.type === 'assistant_message') {
-    // assistant_message 的 dependencies 是 toolCallId
-    // 如果有 toolCallId，必须有对应的 tool_result
+    // assistant_message 的 dependencies 是 toolCallId，须有对应 tool_result
     return resource.dependencies.every(depId => pairMap.has(depId));
   }
   if (resource.type === 'tool_result') {
-    // tool_result 的 dependencies 是 toolCallId
-    // 必须有对应的 assistant_message 或 tool_call 引用该 toolCallId
+    // tool_result 须有发起方（assistant_message 或 tool_call 引用该 toolCallId）
     return resource.dependencies.every(depId =>
       resources.some(r =>
         (r.type === 'assistant_message' || r.type === 'tool_call')
@@ -341,7 +272,6 @@ export function isToolPairComplete(
 
 /**
  * 从 assistant_message.content 中提取 ToolCallContent 的 id。
- * 自包含实现，不依赖 aipack 内部辅助。
  */
 function extractToolCallIdsFromContent(content: unknown): string[] {
   if (!Array.isArray(content)) return [];

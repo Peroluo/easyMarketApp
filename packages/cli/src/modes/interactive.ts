@@ -153,12 +153,12 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
   /** 会话内累计 token（跨多次 send） */
   let usageTotal = { input: 0, output: 0 };
 
-  // L5 新会话交接：真正切换 activeKey（而非仅打印提示后继续写旧会话）
-  opts.compressionTransformer?.setHandoffHook(({ handoff }) => {
+  // 上下文耗尽：切换 activeKey 到压缩器建议的新会话（而非仅打印提示后继续写旧会话）
+  opts.compressionTransformer?.onContextExhausted((e) => {
     console.warn(
-      chalk.yellow(`[aipack] 上下文已达极限，已切换到新会话 ${handoff.newSessionId}（旧会话已归档）`),
+      chalk.yellow(`[aipack] 上下文已达极限（${e.reason}），已切换到新会话 ${e.suggestedSessionId}（旧会话已归档）`),
     );
-    activeKey = handoff.newSessionId;
+    activeKey = e.suggestedSessionId;
     usageTotal = { input: 0, output: 0 };
   });
 

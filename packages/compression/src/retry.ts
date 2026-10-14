@@ -101,16 +101,23 @@ export function computeBackoffDelay(attempt: number, config: RetryConfig): numbe
  * - fn 抛出可重试错误 → 等待退避后重试
  * - fn 抛出不可重试错误 → 立即重新抛出
  * - 重试耗尽 → 抛出最后一次错误
+ * - 退避等待期间 signal abort → 立即抛 AbortError，不再空等
  */
 export async function retryWithBackoff<T>(
   fn: () => Promise<T>,
   config: RetryConfig,
   onRetry?: (err: unknown, attempt: number, delayMs: number) => void,
+  signal?: AbortSignal,
 ): Promise<T> {
   const isRetryable = config.isRetryable ?? isRetryableStreamError;
   let lastErr: unknown;
 
   for (let attempt = 0; attempt <= config.retries; attempt++) {
+    if (signal?.aborted) {
+      const abortErr = new Error('aborted');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
     try {
       return await fn();
     } catch (err) {
@@ -120,10 +127,33 @@ export async function retryWithBackoff<T>(
 
       const delay = computeBackoffDelay(attempt, config);
       onRetry?.(err, attempt + 1, delay);
-      await new Promise<void>(resolve => setTimeout(resolve, delay));
+      await sleepAbortable(delay, signal);
     }
   }
   throw lastErr;
+}
+
+/** 可中断睡眠：signal abort 时提前结束 */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise<void>(resolve => setTimeout(resolve, ms));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      const abortErr = new Error('aborted');
+      abortErr.name = 'AbortError';
+      reject(abortErr);
+    };
+    if (signal.aborted) {
+      clearTimeout(timer);
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 // ─── Fork 组合：runFork + retry ───────────────────────────────────
@@ -177,6 +207,7 @@ export async function runForkWithRetry<T>(
       () => runFork(state, forkTimeoutMs, fn),
       retry,
       (_err, attempt) => { retries = attempt; },
+      state.sessionAbortController?.signal,
     );
     return { ok: true, value: result.value, usage: result.usage, retries, durationMs: Date.now() - start };
   } catch {

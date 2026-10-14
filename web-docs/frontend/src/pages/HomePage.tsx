@@ -46,7 +46,7 @@ const features = [
   {
     icon: '🧩',
     title: '丰富的内置包',
-    desc: '持久化记忆、五级上下文压缩、CLI、可观测性，按需组合，零配置开箱。',
+    desc: '持久化记忆、策略管道上下文压缩、CLI、可观测性，按需组合，零配置开箱。',
     color: 'linear-gradient(135deg, #e0e7ff, #c7d2fe)',
   },
   {
@@ -487,7 +487,7 @@ export default function HomePage() {
                         bordered
                       >
                         <p style={{ color: '#475569', lineHeight: 1.8, fontSize: 14 }}>
-                          五级上下文压缩：L1 裁剪 → L2 摘要 → L3 状态 → L4 检查点 → L5 交接。
+                          策略管道上下文压缩：统一预算双水位，trim 裁剪 → summarize 摘要 → truncate 保底。
                         </p>
                         <Button type="link" icon={<ArrowRightOutlined />} onClick={() => navigate('/packages#compression')}>
                           查看

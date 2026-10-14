@@ -312,19 +312,18 @@ async function loadCompressionSettings(
 }
 
 /**
- * 构建五级压缩转换器（L1 裁剪 → L2 摘要 → L3 状态提取 → L4 检查点 → L5 新会话交接）。
- * 作为第一级 transformer 加入 runtime 降级链：五级压缩 → runtime 内置摘要压缩 → 硬截断。
+ * 构建 v2 压缩转换器（策略管道：trim → summarize → truncate，双水位调度）。
+ * 作为第一级 transformer 加入 runtime 降级链：压缩管道 → runtime 内置摘要压缩 → 硬截断。
  *
  * streamFn 用"委托"实现：transformer 构造后持有闭包，无法替换；
  * 委托函数每次调用时读取最新的 compressionAiModel，/model 切换后
- * L2/L3/L5 的摘要请求跟随当前模型（而非构造时的旧模型）。
+ * summarize/lifecycle 的摘要请求跟随当前模型（而非构造时的旧模型）。
  */
 async function buildCompressionTransformer(opts: {
   args: Args;
   config: AipackCliConfig;
   model: ResolvedModel;
   streamFn: ReturnType<typeof createStreamFnFromAi>;
-  storage?: SessionStorage;
 }): Promise<{
   transformer: ContextCompressionTransformer;
   setModel: (aiModel: AiModel) => void;
@@ -346,16 +345,15 @@ async function buildCompressionTransformer(opts: {
     config: compressionConfig,
     model: adaptAiModel(opts.model.aiModel),
     streamFn: delegatingStreamFn,
-    sessionStorage: opts.storage,
     contextWindow: opts.model.aiModel.contextWindow,
   });
 
-  // L5 交接钩子：默认仅提示（交互模式会覆盖此钩子以真正切换 activeKey；
+  // 上下文耗尽事件：默认仅提示（交互模式会注册自己的处理器以真正切换 activeKey；
   // print/json 单次请求模式下会话随进程结束，提示即足够）
-  transformer.setHandoffHook(({ handoff }) => {
+  transformer.onContextExhausted((e) => {
     console.warn(
-      `[aipack] 上下文已达极限，已生成交接文档并切换到新会话 ${handoff.newSessionId}。` +
-      `恢复: aipack --session ${handoff.newSessionId}`,
+      `[aipack] 上下文已达极限（${e.reason}），已生成交接文档并建议切换到新会话 ${e.suggestedSessionId}。` +
+      `恢复: aipack --session ${e.suggestedSessionId}`,
     );
   });
 
@@ -478,13 +476,12 @@ export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltR
   // ── 系统提示词 ──
   const systemPrompt = buildSystemPrompt(args, memory.content);
 
-  // ── 上下文压缩（五级 transformer + runtime 内置摘要兜底）──
+  // ── 上下文压缩（策略管道 transformer + runtime 内置摘要兜底）──
   const compression = await buildCompressionTransformer({
     args,
     config,
     model,
     streamFn,
-    storage,
   });
 
   // ── 组装 Runtime ──
