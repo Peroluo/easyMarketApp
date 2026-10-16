@@ -6,8 +6,9 @@
  *
  * 生命周期：
  *   宿主 spawn worker → 发 init（toolModules + spec）
- *   → worker 重建工具注册表 + 安装 fs facade → 回 ready
+ *   → worker 重建工具注册表 + 安装 fs facade + 挂载 secrets API → 回 ready
  *   → 宿主发 exec → worker 执行工具 → 回 result（或 error）→ 自行退出
+ *   exec 期间可穿插 broker 交互（M6）：worker 发 request-secret → 宿主回 secret
  *
  * 心跳是协议层消息（独立 op），不是 SandboxEventType 遥测事件：
  *   worker 生命周期内周期性发 op:heartbeat，宿主超时无消息判定僵死强杀。
@@ -41,7 +42,19 @@ export interface ExecMessage {
   args: unknown;
 }
 
-export type HostMessage = InitMessage | ExecMessage;
+/**
+ * 凭证请求（M6 secrets broker）：worker 内工具经 requestSecret 发起，
+ * id 用于并发请求关联（宿主以同 id 的 SecretMessage 响应）。
+ */
+export interface RequestSecretMessage {
+  op: 'request-secret';
+  /** 请求关联 id（worker 侧生成，响应原样带回） */
+  id: string;
+  /** 请求的凭证名（宿主按 spec.secrets 白名单裁决） */
+  name: string;
+}
+
+export type HostMessage = InitMessage | ExecMessage | SecretMessage;
 
 // ─── worker → 宿主（stdout）────────────────────────────────────────
 
@@ -49,5 +62,21 @@ export type WorkerMessage =
   | { op: 'ready' }                                     // 注册表就绪，等待 exec
   | { op: 'heartbeat' }                                 // 协议层心跳（非遥测事件）
   | { op: 'event'; event: SandboxEvent }                // 流式遥测事件（violation/degraded）
+  | RequestSecretMessage                                 // 凭证请求（等待宿主 SecretMessage 响应）
   | { op: 'result'; toolResult: ToolResult }            // 终止消息：正常结果
   | { op: 'error'; message: string; code?: string };     // 终止消息：异常终止
+
+// ─── 宿主 → worker（stdin）的 broker 响应（exec 期间异步到达）─────────
+
+/**
+ * 凭证响应：裁决通过 → value（worker 注入自身 process.env 后 resolve）；
+ * 未声明/宿主不可用 → error（worker reject）。二者互斥。
+ */
+export interface SecretMessage {
+  op: 'secret';
+  /** 响应关联 id（对应 RequestSecretMessage.id） */
+  id: string;
+  name: string;
+  value?: string;
+  error?: string;
+}

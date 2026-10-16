@@ -172,11 +172,12 @@ describe('buildSeatbeltProfile（fs/net/env → profile 映射）', () => {
     assert.ok(p.includes('(deny file-write* (subpath "/data/secret"))'));
   });
 
-  it('网络：deny/proxy 缺省断网（deny default 涵盖）；allow → (allow network*)', () => {
+  it('网络：deny/proxy 无 forwarder 端口缺省断网（deny default 涵盖）；allow → (allow network*)', () => {
     const deny = buildSeatbeltProfile(macSpec({ net: { mode: 'deny' } }), PROFILE_OPTS);
     assert.ok(!deny.includes('network*'));
+    // M6：proxy 需 netProxyPort（forwarder 可用）；未提供 = 不可用 → 保持 deny default
     const proxy = buildSeatbeltProfile(macSpec({ net: { mode: 'proxy', hosts: ['a.com'] } }), PROFILE_OPTS);
-    assert.ok(!proxy.includes('network*'), 'proxy 待 M6 broker，保守拒绝');
+    assert.ok(!proxy.includes('network*'), 'proxy 无 forwarder 端口 = fail-closed 保守断网');
     const allow = buildSeatbeltProfile(macSpec({ net: { mode: 'allow' } }), PROFILE_OPTS);
     assert.ok(allow.includes('(allow network*)'));
   });

@@ -5,7 +5,9 @@
  * - fs：Seatbelt 拒绝式策略——deny default 基线 + 系统/基础设施/工作区
  *   路径逐条 allow；deny 前缀显式拒绝（Seatbelt 取最具体规则优先）；
  * - net：deny 缺省（deny default 已断网）；allow → (allow network*)；
- *   proxy 待 M6 broker，未实现前保持 deny；
+ *   proxy（M6）→ profile 放行 network-outbound 到宿主 forwarder 的
+ *   127.0.0.1:port（Seatbelt 可按 remote 地址强制，比 bwrap 的 env 约定强：
+ *   白名单外的直连被内核拒绝）；forwarder 不可用 → 保持 deny default；
  * - env：macOS 无 --clearenv 等价物，由宿主 spawn env 白名单构造
  *   （复用 buildWorkerEnv POSIX 分支：PATH 最小化、HOME=每次调用临时目录）；
  * - 配额：Seatbelt 无资源配额原语（超出 profile 能力），不施加
@@ -27,6 +29,7 @@ import type {
 } from '../../core/sandbox';
 import type { ToolResult } from '../../core/types';
 import { HEARTBEAT_TIMEOUT_DEFAULT_MS } from './protocol';
+import { makeSandboxEmit, startNetProxyForSpec } from './net-proxy';
 import { resolveWorkerPath, runProtocolSession, buildWorkerEnv } from './subprocess';
 
 const IS_MAC = process.platform === 'darwin';
@@ -45,6 +48,12 @@ export interface SeatbeltProfileOptions {
   workerPath: string;
   /** 工具模块路径（宿主绝对路径，worker 按名重建注册表） */
   toolModules?: string[];
+  /**
+   * 宿主 net forwarder 端口（M6 net.mode 'proxy'）：定义时 profile 放行
+   * network-outbound 到 127.0.0.1:port（其余 remote 全拒 = proxy 强制边界）；
+   * undefined（forwarder 不可用）→ 保持 deny default（fail-closed）。
+   */
+  netProxyPort?: number;
 }
 
 /**
@@ -93,10 +102,15 @@ export function buildSeatbeltProfile(
     lines.push(`(deny file-write* (subpath "${p}"))`);
   }
 
-  // ── 网络：deny 缺省（deny default 已涵盖）；proxy 待 M6 broker 保守拒绝 ──
+  // ── 网络：deny 缺省（deny default 已涵盖）──
   if (spec.net.mode === 'allow') {
     lines.push('(allow network*)');
+  } else if (spec.net.mode === 'proxy' && o.netProxyPort !== undefined) {
+    // proxy（M6）：仅放行到宿主 forwarder（loopback IP 形态，worker 内无需 DNS
+    // 出站——代理变量是 127.0.0.1:port；其余 remote 全拒 = proxy 强制边界）
+    lines.push(`(allow network-outbound (remote ip "127.0.0.1:${o.netProxyPort}"))`);
   }
+  // proxy + forwarder 不可用 → 保持 deny default（fail-closed）
 
   // ── spec.env 不经 profile（macOS env 由宿主 spawn 白名单构造）──
   return lines.join('\n') + '\n';
@@ -154,6 +168,8 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
     const homePath = await nodeFs.promises.mkdtemp(
       nodePath.join(os.tmpdir(), 'aipack-seatbelt-'),
     );
+    // net.mode 'proxy'（M6）：宿主侧 forwarder（profile 放行 loopback 出站 + env 注入）
+    const proxy = await startNetProxyForSpec(req.spec, makeSandboxEmit(req));
     // profile 文件（sandbox-exec -f 读取后即可删，随会话目录一并清理）
     const profilePath = nodePath.join(homePath, 'profile.sb');
     const profile = buildSeatbeltProfile(req.spec, {
@@ -161,24 +177,32 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
       nodeBin: process.execPath,
       workerPath: this._workerPath,
       toolModules: this._toolModules,
+      netProxyPort: proxy?.forwarder.port,
     });
     await nodeFs.promises.writeFile(profilePath, profile, 'utf8');
 
     // sandbox-exec -f profile -- node worker.js
-    return runProtocolSession(
-      {
-        argv: [
-          this._execPath, '-f', profilePath, '--',
-          process.execPath, ...this._nodeArgs, this._workerPath,
-        ],
-        // macOS 无 --clearenv 等价物：env 白名单由宿主 spawn 侧构造
-        env: buildWorkerEnv(req.spec.env, homePath),
-        detached: true,
-        cleanupDirs: [homePath],
-        heartbeatTimeoutMs: this._heartbeatTimeoutMs,
-        toolModules: this._toolModules,
-      },
-      req,
-    );
+    // env 白名单由宿主 spawn 侧构造；proxy 变量在白名单之上合并
+    // （覆盖 spec.env 同名键——proxy 模式下出口归框架）
+    const env = buildWorkerEnv(req.spec.env, homePath);
+    if (proxy !== undefined) Object.assign(env, proxy.env);
+    try {
+      return await runProtocolSession(
+        {
+          argv: [
+            this._execPath, '-f', profilePath, '--',
+            process.execPath, ...this._nodeArgs, this._workerPath,
+          ],
+          detached: true,
+          cleanupDirs: [homePath],
+          heartbeatTimeoutMs: this._heartbeatTimeoutMs,
+          toolModules: this._toolModules,
+          env,
+        },
+        req,
+      );
+    } finally {
+      await proxy?.forwarder.close().catch(() => {});
+    }
   }
 }

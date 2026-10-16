@@ -150,8 +150,9 @@ describe('buildBwrapArgv：fs spec → bwrap 参数映射', () => {
     assert.ok(!argv.includes('/nonexistent/nothing'));
   });
 
-  it('网络：deny/proxy → --unshare-net（proxy 待 M6 broker，保守断网）；allow → 不加', () => {
+  it('网络：deny → --unshare-net；proxy 无 forwarder 端口 → fail-closed 断网；allow → 不加', () => {
     assert.ok(buildBwrapArgv(makeSpec({ net: { mode: 'deny' } }), BASE).includes('--unshare-net'));
+    // M6：proxy 需宿主 forwarder 端口（netProxyPort）；未提供 = forwarder 不可用 → 保守断网
     assert.ok(buildBwrapArgv(makeSpec({ net: { mode: 'proxy', hosts: ['a.com'] } }), BASE).includes('--unshare-net'));
     assert.ok(!buildBwrapArgv(makeSpec({ net: { mode: 'allow' } }), BASE).includes('--unshare-net'));
   });

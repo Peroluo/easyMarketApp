@@ -76,9 +76,32 @@ export interface SandboxSpec {
    *  框架保留变量（PATH/HOME/TMPDIR 等）由 provider 白名单构造，spec.env 不可覆盖（M2 接线）。 */
   env: Record<string, string>;
   resources: SandboxResourceSpec;
+  /**
+   * 凭证请求白名单（M6 secrets broker）：worker 内工具经
+   * globalThis[SANDBOX_GLOBAL_KEY].requestSecret(name) 可请求的宿主持有凭证名。
+   * 宿主按名解析（缺省宿主 process.env[name]）单条发放；未声明名 → 拒绝 + violation。
+   * 沙箱环境内永远不存在全量凭证（按需发放，区别于 spec.env 的直接注入）。 */
+  secrets?: string[];
 }
 
 // ─── 工具侧声明（Tool.sandbox 字段类型）────────────────────────────
+
+/**
+ * worker 进程内暴露给工具的沙箱 API（M6 secrets broker 的 worker 侧入口）。
+ * worker 启动时挂载到 globalThis[SANDBOX_GLOBAL_KEY]，工具按需请求宿主持有凭证
+ * —— 沙箱内不预置任何凭证，宿主按 spec.secrets 白名单裁决后单条发放。
+ */
+export interface SandboxGlobalApi {
+  /**
+   * 请求宿主持有凭证（name 需在 spec.secrets 白名单内）。
+   * 成功：resolve 凭证值，同时注入 worker 自身 process.env[name]（不改造的工具
+   * 请求后即可直接读 env）；未声明/宿主不可用/超时：reject Error。
+   */
+  requestSecret(name: string): Promise<string>;
+}
+
+/** globalThis 上 SandboxGlobalApi 的挂载键 */
+export const SANDBOX_GLOBAL_KEY = '__aipackSandbox';
 
 /** 工具沙箱声明的解析上下文（工厂形参 ctx） */
 export interface ToolSandboxContext {
@@ -266,7 +289,7 @@ function unionDeny(
   return result;
 }
 
-/** proxy hosts 交集（大小写不敏感，保留 tool 侧拼写） */
+/** 白名单交集（大小写不敏感，保留 tool 侧拼写）：hosts（M6 起 secrets 同语义） */
 function intersectHosts(
   toolHosts: readonly string[] | undefined,
   allowedHosts: readonly string[] | undefined,
@@ -318,6 +341,9 @@ export function mergeSpec(
   const netMode = mergeNetMode(d.net?.mode, t.net?.mode) ?? 'deny';
   const hosts = intersectHosts(t.net?.hosts, d.net?.hosts);
 
+  // secrets：白名单交集（运行时只能收紧，更少可请求名；单方取单方）
+  const secrets = intersectHosts(t.secrets, d.secrets);
+
   // env：非收紧字段，工具逐键覆盖
   const env: Record<string, string> = { ...d.env, ...t.env };
 
@@ -345,5 +371,6 @@ export function mergeSpec(
     },
     env,
     resources,
+    ...(secrets !== undefined ? { secrets } : {}),
   };
 }

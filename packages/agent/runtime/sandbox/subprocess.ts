@@ -35,9 +35,12 @@ import { createTextContent } from '../../core/types';
 import {
   HEARTBEAT_TIMEOUT_DEFAULT_MS,
   type HostMessage,
+  type RequestSecretMessage,
+  type SecretMessage,
   type WorkerMessage,
 } from './protocol';
 import { createWindowsProcessAudit } from './audit-win';
+import { makeSandboxEmit, startNetProxyForSpec } from './net-proxy';
 
 const IS_WIN = process.platform === 'win32';
 
@@ -266,6 +269,12 @@ export interface ProtocolSessionSpec {
    * 超限返回 kill 原因（事后审计语义，非硬配额）。
    */
   audit?: (childPid: number) => ResourceAudit | undefined;
+  /**
+   * secrets broker 宿主侧凭证解析（M6）：按名解析宿主持有凭证，
+   * 缺省 process.env[name]。裁决（spec.secrets 白名单）在状态机内，
+   * 此 hook 只管取值——凭证源可注入（测试/自定义存储）。
+   */
+  resolveSecret?: (name: string) => string | undefined;
 }
 
 /** 资源审计接口：平台实现（audit-win）注入，状态机只管周期与 kill */
@@ -288,23 +297,31 @@ async function runInWorker(
     nodePath.join(os.tmpdir(), 'aipack-sandbox-'),
   );
   await nodeFs.promises.mkdir(nodePath.join(sandboxHome, 'tmp'), { recursive: true });
-  return runProtocolSession(
-    {
-      argv: [process.execPath, ...opts.nodeArgs, workerPath],
-      env: buildWorkerEnv(req.spec.env, sandboxHome),
-      detached: !IS_WIN,
-      cleanupDirs: [sandboxHome],
-      heartbeatTimeoutMs: opts.heartbeatTimeoutMs,
-      toolModules: opts.toolModules,
-      // Windows 无 OS 沙箱时（os 降级链终点），声明了 memory/processes 限额
-      // 的调用启用进程树审计（M5 顶替 Job Object 的事后审计语义）
-      ...(IS_WIN &&
-      (req.spec.resources.memoryMb !== undefined || req.spec.resources.processes !== undefined)
-        ? { audit: (pid: number) => createWindowsProcessAudit(pid, req.spec.resources) }
-        : {}),
-    },
-    req,
-  );
+  // ── net.mode 'proxy'（M6）：宿主侧 forwarder + worker env 代理注入 ──
+  const proxy = await startNetProxyForSpec(req.spec, makeSandboxEmit(req));
+  const env = buildWorkerEnv(req.spec.env, sandboxHome);
+  if (proxy !== undefined) Object.assign(env, proxy.env);
+  try {
+    return await runProtocolSession(
+      {
+        argv: [process.execPath, ...opts.nodeArgs, workerPath],
+        env,
+        detached: !IS_WIN,
+        cleanupDirs: [sandboxHome],
+        heartbeatTimeoutMs: opts.heartbeatTimeoutMs,
+        toolModules: opts.toolModules,
+        // Windows 无 OS 沙箱时（os 降级链终点），声明了 memory/processes 限额
+        // 的调用启用进程树审计（M5 顶替 Job Object 的事后审计语义）
+        ...(IS_WIN &&
+        (req.spec.resources.memoryMb !== undefined || req.spec.resources.processes !== undefined)
+          ? { audit: (pid: number) => createWindowsProcessAudit(pid, req.spec.resources) }
+          : {}),
+      },
+      req,
+    );
+  } finally {
+    await proxy?.forwarder.close().catch(() => {});
+  }
 }
 
 /** NDJSON 协议会话宿主侧状态机（spawn / 流处理 / 心跳 / 限额 / kill / 清理） */
@@ -432,6 +449,36 @@ export async function runProtocolSession(
   };
 
   let pending = '';
+  // ── secrets broker 裁决（M6）：白名单（spec.secrets，大小写不敏感）→ 取值 → 回填 ──
+  const sendSecret = (m: SecretMessage): void => {
+    child.stdin!.write(JSON.stringify(m) + '\n');
+  };
+  const handleSecretRequest = (msg: RequestSecretMessage): void => {
+    const declared = spec.secrets ?? [];
+    const allowed = declared.some(d => d.toLowerCase() === msg.name.toLowerCase());
+    if (!allowed) {
+      // 未声明的凭证请求：拒绝 + violation（沙箱内永远不存在未授权凭证面）
+      emit('violation', { kind: 'secret', name: msg.name, reason: 'not-declared' });
+      sendSecret({
+        op: 'secret', id: msg.id, name: msg.name,
+        error: `secret "${msg.name}" is not declared in spec.secrets`,
+      });
+      return;
+    }
+    // 凭证源：resolveSecret 注入（缺省宿主 process.env）——存在即全权负责
+    const value = session.resolveSecret !== undefined
+      ? session.resolveSecret(msg.name)
+      : process.env[msg.name];
+    if (value === undefined) {
+      sendSecret({
+        op: 'secret', id: msg.id, name: msg.name,
+        error: `secret "${msg.name}" is not available on host`,
+      });
+      return;
+    }
+    sendSecret({ op: 'secret', id: msg.id, name: msg.name, value });
+  };
+
   const handleMessage = (line: string): void => {
     lastMessageAt = Date.now();
     let msg: WorkerMessage;
@@ -449,6 +496,9 @@ export async function runProtocolSession(
         break; // 仅刷新时间戳
       case 'event':
         req.onEvent?.(msg.event);
+        break;
+      case 'request-secret':
+        handleSecretRequest(msg);
         break;
       case 'result':
         result = msg.toolResult;
@@ -492,6 +542,14 @@ export async function runProtocolSession(
   });
 
   emit('spawn', { pid: child.pid, argv0: session.argv[0] });
+
+  // net.mode 'allow'（显式直连，宽松上限）：发遥测告警提示收敛到 proxy/deny
+  if (spec.net.mode === 'allow') {
+    emit('degraded', {
+      reason: 'net-allow-direct',
+      hint: 'unrestricted network access; prefer net.mode "proxy" (audited allow-list) or "deny"',
+    });
+  }
 
   // ── 触发器：wallClock / 心跳 / abort ──
   if (spec.resources.wallClockMs !== undefined) {

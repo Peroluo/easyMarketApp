@@ -146,7 +146,7 @@ export type {
 } from './permission';
 
 // ─── Sandbox: 工具执行隔离层（契约 + Tier 1 provider 工厂）──────────
-export { mergeSpec, resolveToolSandbox, isPathWithin } from './sandbox';
+export { mergeSpec, resolveToolSandbox, isPathWithin, SANDBOX_GLOBAL_KEY } from './sandbox';
 export type {
   SandboxStrategy,
   SandboxFsSpec,
@@ -161,6 +161,7 @@ export type {
   SandboxOptions,
   ToolSandboxDeclaration,
   ToolSandboxContext,
+  SandboxGlobalApi,
 } from './sandbox';
 // provider 实现位于 runtime/sandbox（实现类不进 core 契约面，仅工厂）。
 // provider 内部对 core 的依赖直接引具体文件（core/sandbox、core/types），

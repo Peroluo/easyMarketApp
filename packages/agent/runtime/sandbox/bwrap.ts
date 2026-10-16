@@ -6,7 +6,10 @@
  * - fs：最小挂载面——系统目录只读 ro-bind、readable 前缀 ro-bind、writable
  *   前缀 bind；deny 路径在挂载序列末尾以 tmpfs（目录）/ 空文件 ro-bind（文件）
  *   覆盖遮蔽；其余宿主路径一律不存在；
- * - net：deny（含 proxy，broker 未实现前保守处理）→ --unshare-net 内核级断网；
+ * - net：deny → --unshare-net 内核级断网；proxy（M6）→ 不 unshare（需可达
+ *   宿主 loopback forwarder）+ --setenv 代理变量（HTTP_PROXY 是 env 约定，
+ *   强制力如实声明：不合作进程可绕过直连，强制断网只有 deny）；
+ *   allow → 直连；
  * - env：--clearenv + --setenv 白名单（HOME=沙箱内 tmpfs，绝不继承宿主）；
  * - 进程：--unshare-user（显式 user namespace，root 无 CAP_SYS_ADMIN 时必须
  *   走 unprivileged 路径）+ --unshare-pid（pid 隔离）+ --die-with-parent；
@@ -32,6 +35,7 @@ import type {
 } from '../../core/sandbox';
 import type { ToolResult } from '../../core/types';
 import { HEARTBEAT_TIMEOUT_DEFAULT_MS } from './protocol';
+import { makeSandboxEmit, netProxyEnv, startNetProxyForSpec } from './net-proxy';
 import { resolveWorkerPath, runProtocolSession } from './subprocess';
 
 const IS_LINUX = process.platform === 'linux';
@@ -126,6 +130,12 @@ export interface BwrapArgvOptions {
   denyEmptyFile?: string;
   /** 是否施加 systemd-run 配额包装（探测可用时） */
   useQuota?: boolean;
+  /**
+   * 宿主 net forwarder 端口（M6 net.mode 'proxy'）：netProxyPort 定义时
+   * proxy 分支放行网络 + 注入代理 setenv；undefined（forwarder 不可用）
+   * → fail-closed 保守断网。非 proxy 模式忽略。
+   */
+  netProxyPort?: number;
   /** spec.strategy（仅 os 走此 provider） */
 }
 
@@ -216,10 +226,22 @@ export function buildBwrapArgv(spec: SandboxSpec, o: BwrapArgvOptions): string[]
   }
 
   // 7. 网络与进程命名空间
-  if (spec.net.mode !== 'allow') {
-    // deny → 内核断网；proxy → broker（M6）未实现前保守断网
-    argv.push('--unshare-net');
+  if (spec.net.mode === 'deny') {
+    argv.push('--unshare-net'); // deny → 内核级断网（强保证）
+  } else if (spec.net.mode === 'proxy') {
+    if (o.netProxyPort !== undefined) {
+      // proxy（M6）：不 unshare（可达宿主 loopback forwarder）；代理 setenv
+      // 排在 spec.env 之后（同名键后者生效——proxy 模式下出口归框架）；
+      // 键值对单一来源：netProxyEnv（与 Tier 1/Seatbelt 注入一致）
+      const proxyEnv = netProxyEnv(o.netProxyPort);
+      for (const [k, v] of Object.entries(proxyEnv)) {
+        argv.push('--setenv', k, v);
+      }
+    } else {
+      argv.push('--unshare-net'); // forwarder 不可用 → fail-closed 断网
+    }
   }
+  // allow → 不加 unshare（直连；宿主侧发遥测告警提示收敛）
   // --unshare-user 显式声明：root 但无 CAP_SYS_ADMIN（容器）时 bwrap 不会自动
   // 走 unprivileged 路径（默认直接 unshare(CLONE_NEWNS) → EPERM）；桌面非 root
   // 场景与 bwrap 默认 unprivileged 行为一致
@@ -289,6 +311,9 @@ export class BwrapSandboxProvider implements SandboxProvider {
     const denyEmptyFile = nodePath.join(denyDir, 'empty');
     await nodeFs.promises.writeFile(denyEmptyFile, '');
 
+    // net.mode 'proxy'（M6）：宿主侧 forwarder（沙箱共享宿主网络栈可达其 loopback）
+    const proxy = await startNetProxyForSpec(req.spec, makeSandboxEmit(req));
+
     const argv = buildBwrapArgv(req.spec, {
       bwrapBin: this._bwrapBin,
       nodeBin: process.execPath,
@@ -297,19 +322,24 @@ export class BwrapSandboxProvider implements SandboxProvider {
       toolModules: this._toolModules,
       denyEmptyFile,
       useQuota: caps.quota,
+      netProxyPort: proxy?.forwarder.port,
     });
 
     // bwrap 自身用宿主 PATH 定位；沙箱内 env 已由 --clearenv/--setenv 构造
-    return runProtocolSession(
-      {
-        argv,
-        env: { PATH: process.env.PATH ?? SANDBOX_PATH },
-        detached: true,
-        cleanupDirs: [denyDir],
-        heartbeatTimeoutMs: this._heartbeatTimeoutMs,
-        toolModules: this._toolModules,
-      },
-      req,
-    );
+    try {
+      return await runProtocolSession(
+        {
+          argv,
+          env: { PATH: process.env.PATH ?? SANDBOX_PATH },
+          detached: true,
+          cleanupDirs: [denyDir],
+          heartbeatTimeoutMs: this._heartbeatTimeoutMs,
+          toolModules: this._toolModules,
+        },
+        req,
+      );
+    } finally {
+      await proxy?.forwarder.close().catch(() => {});
+    }
   }
 }

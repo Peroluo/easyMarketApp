@@ -623,7 +623,8 @@ prebuilds 发布链复杂度与收益不成比例。**采纳"进程树事后审�
 - **Seatbelt profile**：`(deny default)` 基线 + 进程/syscall 放行（process-exec*、
   mach-lookup 等，**experimental 收敛点**：allow 面需真机校准）+ 系统目录只读 +
   readable/writable/deny 逐路径映射（Seatbelt 最具体规则优先）+ HOME 临时目录读写
-  放行；`net.mode === 'allow'` → `(allow network*)`，proxy 待 M6 broker 保守拒绝；
+  放行；`net.mode === 'allow'` → `(allow network*)`，proxy 已在 M6 落地
+  （forwarder remote 地址放行 + env 代理注入，见 M6 实现说明）；
 - **macOS env 语义差异**：sandbox-exec 无 `--clearenv` 等价物 → env 白名单由宿主
   spawn 侧构造（复用 `buildWorkerEnv` POSIX 分支），profile 不涉及 spec.env；
   Seatbelt 无资源配额原语（memory/processes 依赖 cgroup 类机制），macOS 不施加
@@ -631,11 +632,46 @@ prebuilds 发布链复杂度与收益不成比例。**采纳"进程树事后审�
 - **平台分派**：`createDefaultSandboxProvider` 内 `osProvider = darwin ? seatbelt
 : bwrap`，supports/run/降级链统一经 osProvider 路由。
 
-### M6 网络代理 + 凭证代理（M）
+### M6 网络代理 + 凭证代理（M）✅ 已完成（2026-10-16，Linux 真跑已在容器验证通过）
 
 - 本地 forwarder（Node http + CONNECT 隧道，hosts 白名单 + 审计日志）；
-- secrets broker 协议扩展（`request-secret` op + `spec.env.secrets` 声明）；
+- secrets broker 协议扩展（`request-secret` op + `spec.secrets` 声明）；
 - `--unshare-net` deny 路径与 proxy 路径双测试。
+
+**验收**：`test/sandbox-m6.test.ts` 26 用例全绿（mergeSpec secrets 交集 3 +
+纯函数 argv/profile/env 6 + forwarder 集成 7 + Tier 1 真跑 broker/proxy 端到端
+8 + Linux-only bwrap proxy 放行/拒绝 2）；本地 Windows 全量回归 626/626
+（基线 600 + 新增 26，零回归）；Docker（node:20-slim + bubblewrap 0.8.0 +
+seccomp=unconfined）内 Linux 真跑全绿。
+
+**实现说明**（与原设计的细化）：
+
+- **forwarder**（`runtime/sandbox/net-proxy.ts`）：`startNetForwarder` 监听
+  127.0.0.1 随机端口；普通请求（forward proxy 绝对 URI 形态）按提取 hostname
+  白名单放行后 `http.request` 转发，CONNECT 隧道双向管道不解密（SNI 可见域名
+  裁决）；审计日志记录域名/方法/双向字节量（不记 body）；白名单外 403 +
+  `violation(kind=net)` 事件；空 hosts = 代理全拒（等效 deny）；
+- **三个 provider 的 proxy 分支**：Tier 1/Seatbelt 在 `buildWorkerEnv` 白名单
+  之上合并 `netProxyEnv`（HTTP(S)_PROXY 大小写变体 + NO_PROXY 防环；框架覆盖
+  spec.env 同名键——proxy 模式下出口归框架）；bwrap 不再保守 `--unshare-net`，
+  代理键以 `--setenv` 追加在 spec.env 之后；forwarder 启动失败 → `degraded` 事件
+  + fail-closed 按 deny 处理（bwrap 回落 `--unshare-net`，Seatbelt 保持 deny
+  default）；会话结束 `forwarder.close()`（closeAllConnections 强断活跃隧道）；
+- **强制力如实声明**（与 R6 一致）：Tier 1 与 bwrap 的代理注入是 env 约定，
+  不合作进程可绕过直连（内核强制断网只有 deny 路径）；Seatbelt 额外按 remote
+  地址内核强制（仅放行 `127.0.0.1:port`，白名单外直连被内核拒绝）；
+- **secrets broker**：`SandboxSpec.secrets?: string[]`（mergeSpec 收紧交集，
+  复用 hosts 大小写不敏感语义）；协议新增 `request-secret`（worker→宿主，
+  id 关联并发）与 `secret`（宿主→worker，value/error 互斥）消息；宿主裁决
+  （声明名大小写不敏感匹配 → `ProtocolSessionSpec.resolveSecret` 取值，缺省
+  宿主 `process.env`）后单条发放，worker 侧注入自身 `process.env[name]` 再
+  resolve（不改造的工具请求后即可直接读 env）；未声明名 → 拒绝 +
+  `violation(kind=secret, reason=not-declared)`；声明但宿主不可用 → error
+  响应（非违规）；worker 侧 10s 防御超时防宿主无响应挂死；
+- **worker API**：`globalThis.__aipackSandbox.requestSecret(name)`（
+  `SANDBOX_GLOBAL_KEY` + `SandboxGlobalApi` 契约类型，工具模块顶层即可用）；
+- **allow 告警**：`net.mode 'allow'` 直连时发 `degraded(reason=net-allow-direct)`
+  事件提示收敛到 proxy/deny。
 
 ### M7 CLI 集成（S）
 

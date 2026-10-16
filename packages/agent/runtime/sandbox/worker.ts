@@ -22,9 +22,17 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isPathWithin } from '../../core/sandbox';
 import type { SandboxSpec, SandboxEvent, SandboxEventType } from '../../core/sandbox';
+import { SANDBOX_GLOBAL_KEY } from '../../core/sandbox';
+import type { SandboxGlobalApi } from '../../core/sandbox';
 import type { Tool, ToolResult } from '../../core/types';
 import { createTextContent } from '../../core/types';
-import { HEARTBEAT_INTERVAL_MS, type ExecMessage, type InitMessage, type WorkerMessage } from './protocol';
+import {
+  HEARTBEAT_INTERVAL_MS,
+  type ExecMessage,
+  type InitMessage,
+  type SecretMessage,
+  type WorkerMessage,
+} from './protocol';
 
 // ─── fs ESM 拦截 hook 注册（顶层，先于工具模块加载）────────────────
 // 本文件自身的静态 import（上方 nodeFs 等）在模块实例化时解析，先于本
@@ -186,6 +194,56 @@ function installFsFacade(
   }
 }
 
+// ─── secrets broker client（M6）──────────────────────────────────────
+// 沙箱环境内永远不存在全量凭证：工具经 globalThis[SANDBOX_GLOBAL_KEY]
+// .requestSecret(name) 按需请求，宿主按 spec.secrets 白名单裁决后单条
+// 发放（stdin 回 SecretMessage）；发放值同时注入自身 process.env[name]，
+// 不改造的工具请求后即可直接读 env。未声明名 → 宿主拒绝 + violation。
+
+/** worker 等待宿主凭证响应的防御性超时（正常毫秒级；防宿主 bug 挂死执行） */
+const SECRET_TIMEOUT_MS = 10_000;
+
+const pendingSecrets = new Map<
+  string,
+  { resolve: (v: string) => void; reject: (e: Error) => void }
+>();
+let secretSeq = 0;
+
+/** 宿主 SecretMessage 响应分发（消费循环调用） */
+function handleSecretResponse(msg: SecretMessage): void {
+  const p = pendingSecrets.get(msg.id);
+  if (p === undefined) return; // 未知/已超时 id：忽略
+  pendingSecrets.delete(msg.id);
+  if (msg.error !== undefined) {
+    p.reject(new Error(msg.error));
+  } else if (msg.value !== undefined) {
+    process.env[msg.name] = msg.value; // 单条发放 → 注入自身 env（§7.4）
+    p.resolve(msg.value);
+  } else {
+    p.reject(new Error(`secret broker: malformed response for "${msg.name}"`));
+  }
+}
+
+/** 挂载工具侧 API（init 后、loadTools 前：工具模块顶层即可用） */
+function installSecretsApi(): void {
+  const api: SandboxGlobalApi = {
+    requestSecret(name: string): Promise<string> {
+      const id = `sec_${++secretSeq}`;
+      return new Promise<string>((resolve, reject) => {
+        pendingSecrets.set(id, { resolve, reject });
+        setTimeout(() => {
+          const p = pendingSecrets.get(id);
+          if (p === undefined) return;
+          pendingSecrets.delete(id);
+          p.reject(new Error(`request-secret timeout: "${name}" (host unresponsive?)`));
+        }, SECRET_TIMEOUT_MS).unref();
+        send({ op: 'request-secret', id, name });
+      });
+    },
+  };
+  (globalThis as Record<string, unknown>)[SANDBOX_GLOBAL_KEY] = api;
+}
+
 // ─── 工具注册表重建 ─────────────────────────────────────────────────
 
 function isToolLike(v: unknown): v is Tool {
@@ -272,10 +330,12 @@ async function main(): Promise<void> {
   strategy = init.spec.strategy;
 
   // ── fs facade 先于工具模块加载安装（覆盖模块顶层 fs 调用），
+  //    secrets API 同理先挂载（工具模块顶层即可请求），
   //    再重建注册表（闭包工具无法跨进程，按 toolModules 按名重建）──
   installFsFacade(init.spec, v =>
     sendEvent('violation', { op: v.mode, path: v.violationPath }),
   );
+  installSecretsApi();
   const { tools, errors } = await loadTools(init.toolModules);
 
   if (Object.keys(errors).length > 0) {
@@ -289,6 +349,24 @@ async function main(): Promise<void> {
   const exec = JSON.parse(second.value as string) as ExecMessage;
   if (exec.op !== 'exec') throw new Error(`expected exec, got "${String(exec.op)}"`);
   execCtx = { toolName: exec.toolName, toolCallId: exec.toolCallId };
+
+  // ── broker 响应消费循环（M6）：exec 期间宿主回发的 SecretMessage 在此分发。
+  //    主流程已不再读 stdin；result 后 lines.close() 使循环随 done 退出 ──
+  const consumeBroker = (async (): Promise<void> => {
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done) return;
+      try {
+        const msg = JSON.parse(next.value as string) as SecretMessage;
+        if (msg !== null && typeof msg === 'object' && msg.op === 'secret') {
+          handleSecretResponse(msg);
+        }
+      } catch {
+        // 畸形行（协议容错）：忽略
+      }
+    }
+  })();
+  void consumeBroker; // 不 await：与工具执行并发，异常面由 unhandledRejection 兜底
 
   const tool = tools.get(exec.toolName);
   if (tool === undefined) {
