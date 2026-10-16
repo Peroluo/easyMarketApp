@@ -236,6 +236,12 @@ export interface RuntimeOptions {
   approvals?: import('./permission').ApprovalManager;
   /** 审批等待超时（毫秒，默认 300000 = 5 分钟）。超时审批单以 timeout 结算，视为拒绝 */
   approvalTimeoutMs?: number;
+  /**
+   * 沙箱配置（可选，见 core/sandbox）。工具执行隔离层，与 PermissionPolicy 正交：
+   * 权限 = 事前授权（fail-closed），沙箱 = 事中约束（能力不足降级 + 告警）。
+   * 未配置时：声明了 Tool.sandbox 的工具降级 inprocess 直跑并发遥测告警（M3 接线）。
+   */
+  sandbox?: import('./sandbox').SandboxOptions;
   /** traceId 生成器（可选，默认 Date+UUID；测试可注入确定性 id） */
   traceIdGenerator?: () => string;
 }

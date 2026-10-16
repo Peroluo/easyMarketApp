@@ -25,6 +25,7 @@ import type { Request } from './request';
 import type { Result } from './result';
 import type { ToolResult } from './types';
 import type { AgentErrorCategory } from './errors';
+import type { SandboxStrategy, SandboxEventType } from './sandbox';
 
 /**
  * 统一错误分类：复用 AI 层 AgentErrorCategory，另加非模型错误类别。
@@ -190,6 +191,18 @@ export interface HookErrorTelemetryInfo {
   error: unknown;
 }
 
+/** 沙箱执行事件载荷（provider 生命周期 / 越界拦截 / 降级 / 限额触发，见 core/sandbox） */
+export interface SandboxTelemetryInfo {
+  traceId: string;
+  sessionKey: string;
+  toolName: string;
+  toolCallId: string;
+  /** 事件归属的隔离策略（原始 spec.strategy，含降级前声明） */
+  strategy: SandboxStrategy;
+  type: SandboxEventType;
+  detail?: Record<string, unknown>;
+}
+
 export interface Telemetry {
   /** 一次 run()/stream() 入队开始 */
   onRunStart?(info: RunStartTelemetryInfo): void | Promise<void>;
@@ -211,6 +224,8 @@ export interface Telemetry {
   onApprovalResolved?(info: ApprovalResolvedTelemetryInfo): void | Promise<void>;
   /** 扩展钩子（tap）抛错（默认策略下 tap 失败不影响主流程） */
   onHookError?(info: HookErrorTelemetryInfo): void | Promise<void>;
+  /** 沙箱执行事件（worker spawn/exit/killed、violation 拦截、策略降级、限额触发） */
+  onSandboxEvent?(info: SandboxTelemetryInfo): void | Promise<void>;
 }
 
 /** 空实现（默认），便于组合 */

@@ -18,8 +18,11 @@ import type {
   PermissionRequest,
   PermissionPolicy,
   ApprovalManager,
+  SandboxOptions,
+  SandboxProvider,
+  SandboxEvent,
 } from '../core';
-import { createTextContent } from '../core';
+import { createTextContent, mergeSpec, resolveToolSandbox } from '../core';
 import type { ErrorClass } from '../telemetry';
 import {
   withTimeoutSignal,
@@ -30,6 +33,7 @@ import {
   type SingleToolOutcome,
 } from './shared';
 import type { RuntimeTelemetry } from './telemetry';
+import { createDefaultSandboxProvider } from './sandbox';
 
 export interface ToolExecutorDeps {
   hooks: RuntimeHooks;
@@ -46,6 +50,10 @@ export interface ToolExecutorDeps {
   getTools: () => Map<string, Tool>;
   /** 扩展共享状态（Extension 应用后存在） */
   getShared: () => Map<string, unknown> | undefined;
+  /** 沙箱配置（RuntimeOptions.sandbox）。未配置：声明 sandbox 的工具降级 inprocess 直跑 + 遥测告警 */
+  sandbox: SandboxOptions | undefined;
+  /** 工作区根（fs 缺省回填 / ToolSandboxContext） */
+  workspace: string | undefined;
 }
 
 export class ToolExecutor {
@@ -235,11 +243,18 @@ export class ToolExecutor {
       // 允许 beforeToolCall 改写参数
       args = before.args;
 
-      // ─── 执行工具 ───
+      // ─── 执行工具：未声明 sandbox 直跑（零迁移保证）；
+      // 声明了 → 沙箱路由（解析/合并 spec → enforced 判定 → provider.run）───
       const toolStartedAt = Date.now();
       let result: ToolResult;
       try {
-        result = await tool.execute(toolCall.id, args, timedSignal);
+        if (tool.sandbox === undefined) {
+          result = await tool.execute(toolCall.id, args, timedSignal);
+        } else {
+          result = await this.executeSandboxed(
+            tool, toolCall, args, request, traceId, timedSignal,
+          );
+        }
       } catch (err) {
         const message = (err as Error)?.message ?? String(err);
         result = {
@@ -285,6 +300,115 @@ export class ToolExecutor {
 
   isErrorResult(result: ToolResult): boolean {
     return toolResultStatus(result) === 'error';
+  }
+
+  // ─── 沙箱执行路由（M3）────────────────────────────────────────────
+
+  /** 缺省 provider 惰性构建（首次声明 sandbox 的调用时） */
+  private _defaultProvider: SandboxProvider | undefined;
+
+  private getSandboxProvider(): SandboxProvider {
+    const configured = this._d.sandbox?.provider;
+    if (configured) return configured;
+    if (this._defaultProvider === undefined) {
+      this._defaultProvider = createDefaultSandboxProvider({
+        toolModules: this._d.sandbox?.toolModules,
+      });
+    }
+    return this._defaultProvider;
+  }
+
+  /** 沙箱事件 → onSandboxEvent 遥测（provider onEvent 与本层降级共用出口）。
+   *  toolName/toolCallId/strategy 由本层上下文填充（provider 事件与本层调用一致） */
+  private emitSandboxEvent(
+    request: Request,
+    traceId: string,
+    ctx: { toolName: string; toolCallId: string; strategy: SandboxEvent['strategy'] },
+    event: Pick<SandboxEvent, 'type'> & { detail?: Record<string, unknown> },
+  ): void {
+    void this._d.telemetry.emit('onSandboxEvent', {
+      traceId,
+      sessionKey: request.sessionKey ?? this._d.defaultSessionKey,
+      toolName: ctx.toolName,
+      toolCallId: ctx.toolCallId,
+      strategy: ctx.strategy,
+      type: event.type,
+      ...(event.detail !== undefined ? { detail: event.detail } : {}),
+    });
+  }
+
+  /**
+   * 沙箱化执行：解析/合并 spec（收紧语义见 core/sandbox mergeSpec）→
+   * enforced 能力判定 → provider.run。
+   *
+   * - 未配置 RuntimeOptions.sandbox：降级 inprocess 直跑 + degraded 遥测告警
+   *   （沙箱是加固层，fail-open；权限层仍是安全底线）；
+   * - spec.strategy = inprocess：不经 provider 直跑（Tier 0 定位：进程内）；
+   * - enforced：声明 os/microvm 的工具在平台能力不足时直接拒绝（不降级）；
+   *   支持性探测走 provider.supports，降级链由 default provider 内部处理
+   *   （os → subprocess，每级降级发 degraded 事件）；
+   * - provider.run 异常：error 结果兜底（沙箱基础设施故障不应炸 run）。
+   * wallClockMs 与 toolTimeoutMs 取 min：timedSignal 同时传入 provider，
+   * provider 内部 wallClock 计时与外部信号先到者生效。
+   */
+  private async executeSandboxed(
+    tool: Tool,
+    toolCall: ToolCallContent,
+    args: unknown,
+    request: Request,
+    traceId: string,
+    signal: AbortSignal,
+  ): Promise<ToolResult> {
+    const sandbox = this._d.sandbox;
+    const partial = resolveToolSandbox(tool.sandbox, args, this._d.workspace);
+    const spec = mergeSpec(sandbox?.defaults, partial, this._d.workspace);
+    const ctx = {
+      toolName: toolCall.name,
+      toolCallId: toolCall.id,
+      strategy: spec.strategy,
+    };
+    const onEvent = (event: Pick<SandboxEvent, 'type'> & { detail?: Record<string, unknown> }) =>
+      this.emitSandboxEvent(request, traceId, ctx, event);
+
+    // 未配置沙箱：降级 inprocess 直跑 + degraded 遥测（fail-open + 告警）
+    if (sandbox === undefined) {
+      onEvent({
+        type: 'degraded',
+        detail: { from: spec.strategy, to: 'inprocess', reason: 'no-sandbox-configured' },
+      });
+      return tool.execute(toolCall.id, args, signal);
+    }
+
+    // inprocess：Tier 0 进程内直跑，不经 provider（无 spawn 开销）
+    if (spec.strategy === 'inprocess') {
+      return tool.execute(toolCall.id, args, signal);
+    }
+
+    const provider = this.getSandboxProvider();
+
+    // enforced 严格模式：能力不足直接拒绝（禁止降级）
+    if (sandbox.enforced && !(await provider.supports(spec.strategy))) {
+      const reason =
+        `sandbox enforced: strategy "${spec.strategy}" unsupported on this platform ` +
+        `(tool "${toolCall.name}" declares a sandbox tier the runtime cannot provide)`;
+      onEvent({
+        type: 'degraded',
+        detail: { reason: 'enforced-unsupported', strategy: spec.strategy, blocked: true },
+      });
+      return {
+        content: [createTextContent(`[blocked] ${reason}`)],
+        details: { blocked: true, sandboxEnforced: true, reason },
+      };
+    }
+
+    return provider.run({
+      toolName: toolCall.name,
+      toolCallId: toolCall.id,
+      args,
+      spec,
+      signal,
+      onEvent,
+    });
   }
 
   /** beforeToolCall 阻断/终止时生成拒绝结果（非执行错误，isError=false） */

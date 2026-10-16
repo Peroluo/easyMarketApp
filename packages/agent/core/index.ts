@@ -58,6 +58,7 @@ export type {
   ApprovalResolvedTelemetryInfo,
   CompactionTelemetryInfo,
   HookErrorTelemetryInfo,
+  SandboxTelemetryInfo,
 } from './telemetry';
 
 // ─── Tapable: 事件钩子系统 ─────────────────────────────────────────
@@ -143,6 +144,29 @@ export type {
   ApprovalAuditRecord,
   ApprovalStore,
 } from './permission';
+
+// ─── Sandbox: 工具执行隔离层（契约 + Tier 1 provider 工厂）──────────
+export { mergeSpec, resolveToolSandbox, isPathWithin } from './sandbox';
+export type {
+  SandboxStrategy,
+  SandboxFsSpec,
+  SandboxNetMode,
+  SandboxNetSpec,
+  SandboxResourceSpec,
+  SandboxSpec,
+  SandboxRunRequest,
+  SandboxProvider,
+  SandboxEvent,
+  SandboxEventType,
+  SandboxOptions,
+  ToolSandboxDeclaration,
+  ToolSandboxContext,
+} from './sandbox';
+// provider 实现位于 runtime/sandbox（实现类不进 core 契约面，仅工厂）。
+// provider 内部对 core 的依赖直接引具体文件（core/sandbox、core/types），
+// 不经本桶，避免 core → runtime → core 的运行时循环。
+export { createDefaultSandboxProvider } from '../runtime/sandbox';
+export type { DefaultSandboxProviderOptions } from '../runtime/sandbox';
 
 // ─── Session: 会话持久化契约 ──────────────────────────────────────
 export { SESSION_VERSION } from './session';

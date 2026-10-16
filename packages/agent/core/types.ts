@@ -127,6 +127,12 @@ export interface Tool {
     signal?: AbortSignal,
   ) => Promise<ToolResult>;
   prepareArguments?: (args: unknown) => unknown;
+  /**
+   * 沙箱执行声明（可选）。未声明 = 不进入隔离链路，行为零变化（零迁移保证）；
+   * 声明 = 进入隔离链路，由 SandboxProvider 在 spec 约束下执行（见 core/sandbox）。
+   * 可为静态 spec（Partial）或基于 args 的动态工厂（如按命令参数授予不同可写路径）。
+   */
+  sandbox?: import('./sandbox').ToolSandboxDeclaration;
 }
 
 // ─── 上下文 ───────────────────────────────────────────────────────
