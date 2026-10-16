@@ -599,6 +599,17 @@ export class AgentRuntime implements Runtime {
     this._store.clearMessages(sessionKey ?? this._sessionKey);
   }
 
+  /**
+   * 设置指定会话的标题并持久化（/rename 类操作）。
+   * 会话不在内存时先从存储恢复既有内容再写回，不丢失消息。
+   */
+  async setSessionTitle(sessionKey: string, title: string): Promise<void> {
+    const session = this._store.ensure(sessionKey);
+    if (!session.hydrated) await this._persistence.hydrate(sessionKey, session);
+    session.title = title;
+    if (this._sessionStorage) await this._persistence.persist(sessionKey, session);
+  }
+
   /** 删除指定会话（内存 + 存储），返回是否删除成功 */
   async deleteSession(sessionKey?: string): Promise<boolean> {
     const key = sessionKey ?? this._sessionKey;

@@ -8,9 +8,13 @@
  * 确认结束重建 readline。
  */
 import readline from 'node:readline';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import chalk from 'chalk';
 import {
   getBuiltinModels,
+  getBuiltinProviders,
+  hasProviderConfigured,
   adaptAiModel,
 } from '@aipack-ai/agent';
 import type {
@@ -21,17 +25,22 @@ import type {
   SessionStorage,
   ThinkingLevel,
   PermissionRequest,
+  Message,
+  ToolResultMessage,
 } from '@aipack-ai/agent';
 import { expandSkillCommand } from '@aipack-ai/skills';
 import type { Skill } from '@aipack-ai/skills';
 import type { Args } from '../args.js';
+import { suggestSimilar } from '../args.js';
+import { formatErrorForUser } from '../errors.js';
+import { selectTools } from '../tools.js';
 import type { ResolvedModel } from '../builder.js';
-import { listSessionsByRecency, buildCustomModel } from '../builder.js';
+import { listSessionInfos, formatRelativeTime, buildCustomModel } from '../builder.js';
 import type { SubagentDefinition } from '../subagents.js';
 import type { McpPlugin } from '@aipack-ai/mcp';
 import type { ContextCompressionTransformer } from '@aipack-ai/compression';
 import { ChunkRenderer } from './render.js';
-import { ask } from '../prompt.js';
+import { select, type SelectOption } from '../select.js';
 import { printStartupBanner } from '../banner.js';
 import { buildInitialMessage, extractFileRefs } from '../initial-message.js';
 import { INIT_COMMAND_PROMPT } from '../memory.js';
@@ -53,7 +62,7 @@ export interface InteractiveOptions {
   subagents?: Map<string, SubagentDefinition>;
   /** task（子 agent）工具是否启用（/agents 提示排除方式） */
   taskEnabled?: boolean;
-  /** 五级压缩转换器（覆盖 L5 handoff 钩子实现真正的会话切换） */
+  /** 压缩策略管道转换器（上下文耗尽事件时接管真正的会话切换） */
   compressionTransformer?: ContextCompressionTransformer;
   /** 启动时的初始消息（aipack "帮我..."） */
   initialMessages?: string[];
@@ -68,6 +77,13 @@ export interface InteractiveOptions {
 }
 
 const VALID_THINKING = new Set(['off', 'minimal', 'low', 'medium', 'high', 'max']);
+
+/** 全部斜杠命令（did-you-mean 与 Tab 补全候选，与 handleCommand 分支保持一致） */
+const SLASH_COMMANDS = [
+  '/help', '/init', '/memory', '/skills', '/quit', '/exit', '/model', '/thinking',
+  '/system', '/session', '/sessions', '/rename', '/export', '/clear', '/compact',
+  '/tools', '/agents', '/config', '/mcp', '/approvals', '/approve', '/deny',
+];
 
 export async function runInteractiveMode(opts: InteractiveOptions): Promise<void> {
   const { runtime, sessionKey, model, args, storage, approvalManager, mcp } = opts;
@@ -108,12 +124,46 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
   let rl!: readline.Interface;
   /** rl.close() 来自"确认前接管"而非退出 */
   let recreating = false;
+  /**
+   * 输入历史（↑/↓ 翻阅）：readline 直接 mutate 本数组，
+   * 权限确认销毁重建 rl 时传入同一引用，历史得以跨重建保留
+   */
+  const inputHistory: string[] = [];
+
+  /**
+   * Tab 补全：行首斜杠 → 补全斜杠命令（含 /skill:）；
+   * 行尾 @ 路径 → 补全文件路径（目录以 / 结尾）。
+   * 返回 [候选列表, 被替换的行尾子串]（readline completer 协议）。
+   */
+  async function completeInput(line: string): Promise<[string[], string]> {
+    if (line.startsWith('/')) {
+      const lower = line.toLowerCase();
+      const candidates = [
+        ...SLASH_COMMANDS,
+        ...(opts.skills ?? []).map(s => `/skill:${s.name}`),
+      ];
+      return [candidates.filter(c => c.startsWith(lower)), line];
+    }
+    const m = line.match(/(^|\s)@([^\s]*)$/);
+    if (m) {
+      const partial = m[2];
+      const hits = await listPathCompletions(partial);
+      if (hits.length === 0) return [[], line];
+      // 保留用户输入的目录前缀（含原有分隔符），候选最多展示 50 个
+      const sep = Math.max(partial.lastIndexOf('/'), partial.lastIndexOf('\\'));
+      const dirPrefix = sep === -1 ? '' : partial.slice(0, sep + 1);
+      return [hits.slice(0, 50).map(h => `@${dirPrefix}${h}`), `@${partial}`];
+    }
+    return [[], line];
+  }
 
   function setupRl(): void {
     rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
       prompt: buildPrompt(),
+      history: inputHistory,
+      completer: completeInput,
     });
 
     rl.on('SIGINT', () => {
@@ -149,9 +199,31 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
     rl.prompt();
   }
 
+  /**
+   * 临时关闭主 rl 弹出选择器（避免与 select 抢占 stdin），结束重建。
+   * 与权限确认（confirmRef 包装）同一生命周期模式。
+   */
+  async function selectWithRlPaused<T extends string>(
+    question: string,
+    options: SelectOption<T>[],
+    defaultIndex = 0,
+  ): Promise<T | null> {
+    recreating = true;
+    rl.close();
+    try {
+      return await select<T>(question, options, defaultIndex);
+    } finally {
+      recreating = false;
+      setupRl();
+    }
+  }
+
   // ── 请求执行 ──
   /** 会话内累计 token（跨多次 send） */
   let usageTotal = { input: 0, output: 0 };
+
+  /** 当前思考级别（args 初始化，/thinking 更新；/config 展示用） */
+  let currentThinking: string = args.thinking ?? 'off';
 
   // 上下文耗尽：切换 activeKey 到压缩器建议的新会话（而非仅打印提示后继续写旧会话）
   opts.compressionTransformer?.onContextExhausted((e) => {
@@ -196,7 +268,8 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
     } catch (err) {
       // 复位渲染器（停止 spinner 等），避免异常时动画残留在终端
       renderer.reset();
-      console.log(chalk.red(`错误: ${err instanceof Error ? err.message : String(err)}`));
+      // 错误分级：常见 API/网络错误翻译为可行动提示，--debug 下附堆栈
+      console.log(chalk.red(`错误: ${formatErrorForUser(err)}`));
     } finally {
       busy = false;
       // 依次处理 busy 期间排队的输入；无排队才回到提示符
@@ -301,40 +374,83 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
         return;
 
       case '/model': {
+        /** 切换到 provider/id（内置目录命中或构造自定义模型） */
+        const switchModel = (spec: string): void => {
+          const slash = spec.indexOf('/');
+          const provider = slash === -1 ? model.aiModel.provider : spec.slice(0, slash);
+          const id = slash === -1 ? spec : spec.slice(slash + 1);
+          const found = getBuiltinModels(provider).find(m => m.id === id);
+          if (found) {
+            runtime.setModel(adaptAiModel(found));
+            model.aiModel = found;
+            model.custom = false;
+            opts.setCompressionModel?.(found);
+            console.log(chalk.green(`已切换到 ${provider}/${id}`));
+          } else {
+            // 目录外自定义模型：按提供商 API 推断构造（上下文窗口为保守默认值）
+            const custom = buildCustomModel(provider, id);
+            runtime.setModel(adaptAiModel(custom));
+            model.aiModel = custom;
+            model.custom = true;
+            opts.setCompressionModel?.(custom);
+            console.log(chalk.green(`已切换到自定义模型 ${provider}/${id}（不在内置目录，参数按提供商推断）`));
+            console.log(chalk.dim(`内置模型可用: ${getBuiltinModels(provider).map(m => m.id).join(', ') || '(无)'}`));
+          }
+        };
+
         if (!rest) {
           console.log(chalk.dim(`当前模型: ${model.aiModel.provider}/${model.aiModel.id}`));
-          console.log(chalk.dim('用法: /model provider/model-id（如 /model deepseek/deepseek-chat）'));
+          // TTY：弹出选择器（仅列已配置 API Key 的 provider，控制列表长度）
+          if (!process.stdin.isTTY) {
+            console.log(chalk.dim('用法: /model provider/model-id（如 /model deepseek/deepseek-chat）'));
+            break;
+          }
+          const options: SelectOption<string>[] = [];
+          for (const p of getBuiltinProviders()) {
+            if (!hasProviderConfigured(p.id)) continue;
+            for (const m of getBuiltinModels(p.id)) {
+              const flags = [m.reasoning ? '推理' : null, `${(m.contextWindow / 1000) | 0}k`]
+                .filter(Boolean).join(' ');
+              options.push({ label: `${p.id}/${m.id} ${chalk.dim(flags)}`, value: `${p.id}/${m.id}` });
+            }
+          }
+          if (options.length === 0) {
+            console.log(chalk.dim('用法: /model provider/model-id（未配置 API Key，无内置模型可选；--list-models 查看全部）'));
+            break;
+          }
+          const current = `${model.aiModel.provider}/${model.aiModel.id}`;
+          const defIdx = Math.max(0, options.findIndex(o => o.value === current));
+          const picked = await selectWithRlPaused('切换模型（Esc 取消）', options, defIdx);
+          if (picked === null) break; // Esc 取消
+          if (picked === current) {
+            console.log(chalk.dim('已是当前模型'));
+            break;
+          }
+          switchModel(picked);
+          rl.setPrompt(buildPrompt()); // 提示符含模型名，切换后刷新
           break;
         }
-        const slash = rest.indexOf('/');
-        const provider = slash === -1 ? model.aiModel.provider : rest.slice(0, slash);
-        const id = slash === -1 ? rest : rest.slice(slash + 1);
-        const found = getBuiltinModels(provider).find(m => m.id === id);
-        if (found) {
-          runtime.setModel(adaptAiModel(found));
-          model.aiModel = found;
-          model.custom = false;
-          opts.setCompressionModel?.(found);
-          console.log(chalk.green(`已切换到 ${provider}/${id}`));
-        } else {
-          // 目录外自定义模型：按提供商 API 推断构造（上下文窗口为保守默认值）
-          const custom = buildCustomModel(provider, id);
-          runtime.setModel(adaptAiModel(custom));
-          model.aiModel = custom;
-          model.custom = true;
-          opts.setCompressionModel?.(custom);
-          console.log(chalk.green(`已切换到自定义模型 ${provider}/${id}（不在内置目录，参数按提供商推断）`));
-          console.log(chalk.dim(`内置模型可用: ${getBuiltinModels(provider).map(m => m.id).join(', ') || '(无)'}`));
-        }
+        switchModel(rest);
+        rl.setPrompt(buildPrompt());
         break;
       }
 
       case '/thinking': {
+        // /thinking show [on|off]：切换思考过程显示（渲染层开关，与思考级别独立）
+        if (rest === 'show' || rest === 'show on' || rest === 'show off') {
+          const next = rest === 'show' ? !renderer.showThinking : rest === 'show on';
+          renderer.setShowThinking(next);
+          console.log(chalk.green(
+            `思考过程显示: ${next ? '开（流式输出思考内容）' : '关（折叠为提示动画）'}`,
+          ));
+          break;
+        }
         if (!VALID_THINKING.has(rest)) {
-          console.log(chalk.dim('用法: /thinking <off|minimal|low|medium|high|max>'));
+          console.log(chalk.dim('用法: /thinking <off|minimal|low|medium|high|max> 或 /thinking show [on|off]'));
           break;
         }
         runtime.setThinkingLevel(rest as ThinkingLevel);
+        currentThinking = rest;
         console.log(chalk.green(`思考级别: ${rest}`));
         break;
       }
@@ -363,16 +479,48 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
           console.log(chalk.yellow('当前为临时会话，无持久化存储'));
           break;
         }
-        const sessions = await listSessionsByRecency(storage);
+        // /sessions rm <编号>：删除列表中的历史会话（当前会话禁删）
+        if (rest.startsWith('rm ') || rest === 'rm') {
+          const rmArg = rest === 'rm' ? '' : rest.slice('rm '.length);
+          const rmIdx = Number.parseInt(rmArg, 10);
+          if (!Number.isInteger(rmIdx) || rmIdx < 1) {
+            console.log(chalk.dim('用法: /sessions rm <编号>（先用 /sessions 查看编号；当前会话不可删）'));
+            break;
+          }
+          const all = await listSessionInfos(storage);
+          if (rmIdx > Math.min(all.length, 10)) {
+            console.log(chalk.yellow(`编号超出范围（列表仅显示前 10 个，共 ${all.length} 个）`));
+            break;
+          }
+          const target = all[rmIdx - 1];
+          if (target.key === activeKey) {
+            console.log(chalk.yellow('不能删除当前会话（切换到其他会话或新会话后再删）'));
+            break;
+          }
+          const ok = await runtime.deleteSession(target.key);
+          if (ok) {
+            console.log(chalk.green(`已删除会话 ${target.title || target.key}`));
+          } else {
+            console.log(chalk.yellow(`删除失败（会话 ${target.key} 不存在或已删除）`));
+          }
+          break;
+        }
+        const sessions = await listSessionInfos(storage);
         if (sessions.length === 0) {
           console.log(chalk.dim('（无历史会话）'));
           break;
         }
-        console.log(sessions.slice(0, 10).map((s, i) => `${s === activeKey ? chalk.green('▸ ') : '  '}${i + 1}. ${s}`).join('\n'));
+        // 展示「标题（缺省回退 key）+ 相对时间」，替代此前不可辨认的裸 key
+        console.log(sessions.slice(0, 10).map((s, i) => {
+          const label = s.title || chalk.dim(s.key);
+          const time = formatRelativeTime(s.updatedAt);
+          return `${s.key === activeKey ? chalk.green('▸ ') : '  '}${i + 1}. ${label}` +
+            (time ? chalk.dim(`  · ${time}`) : '');
+        }).join('\n'));
         // /sessions <n>：直接切换到列表中的会话（此前只能看不能切，跨会话续聊要退出重进）
         const idx = Number.parseInt(rest, 10);
         if (Number.isInteger(idx) && idx >= 1 && idx <= Math.min(sessions.length, 10)) {
-          const target = sessions[idx - 1];
+          const target = sessions[idx - 1].key;
           if (target === activeKey) {
             console.log(chalk.dim('已是当前会话'));
             break;
@@ -381,7 +529,42 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
           usageTotal = { input: 0, output: 0 };
           console.log(chalk.green(`已切换到会话 ${target}`));
         } else {
-          console.log(chalk.dim('切换: /sessions <编号>（如 /sessions 2）；退出后也可用 aipack --session <key> 恢复'));
+          console.log(chalk.dim('切换: /sessions <编号>（如 /sessions 2）· 删除: /sessions rm <编号>；退出后也可用 aipack --session <key> 恢复'));
+        }
+        break;
+      }
+
+      case '/rename': {
+        if (!rest) {
+          console.log(chalk.dim('用法: /rename <名称>（/sessions 列表与 --resume 选择时显示该名称）'));
+          break;
+        }
+        if (!storage || args.noSession) {
+          console.log(chalk.yellow('临时会话（--no-session）不支持命名'));
+          break;
+        }
+        try {
+          await runtime.setSessionTitle(activeKey, rest);
+          console.log(chalk.green(`会话已命名: ${rest}`));
+        } catch (err) {
+          console.log(chalk.red(`命名失败: ${err instanceof Error ? err.message : String(err)}`));
+        }
+        break;
+      }
+
+      case '/export': {
+        const messages = await runtime.loadMessages(activeKey);
+        if (messages.length === 0) {
+          console.log(chalk.yellow('当前会话无消息可导出'));
+          break;
+        }
+        // 默认文件名：会话 key 安全化（非法字符折叠为 _）
+        const file = rest || `aipack-session-${activeKey.replace(/[^\w.-]/g, '_')}.md`;
+        try {
+          await fs.writeFile(file, buildSessionMarkdown(activeKey, messages), 'utf-8');
+          console.log(chalk.green(`已导出 ${messages.length} 条消息到 ${file}`));
+        } catch (err) {
+          console.log(chalk.red(`导出失败: ${err instanceof Error ? err.message : String(err)}`));
         }
         break;
       }
@@ -425,6 +608,37 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
           console.log(`  ${chalk.cyan(name)}  ${def.description}${model}`);
         }
         console.log(chalk.dim('定义: aipack.config.js 的 agents 字段；同一回合多个 task 调用并行执行'));
+        break;
+      }
+
+      case '/config': {
+        // 当前生效配置总览（CLI 侧可见状态；runtime 内部状态经 /model /thinking 可查改）
+        const cw = model.aiModel.contextWindow ? ` · ${(model.aiModel.contextWindow / 1000) | 0}k 上下文` : '';
+        const permission = args.yes
+          ? '自动批准一切（--yes，含危险命令）'
+          : args.safe
+            ? '全部人工确认（--safe）'
+            : '默认（bash 非危险命令静默放行，其余弹确认）';
+        const toolSelection = selectTools({
+          tools: args.tools,
+          excludeTools: args.excludeTools,
+          noTools: args.noTools,
+        });
+        const line = (label: string, value: string): void => {
+          console.log(`  ${chalk.bold(label.padEnd(10))}${value}`);
+        };
+        console.log(chalk.bold.magenta('当前配置:'));
+        line('模型', `${model.aiModel.provider}/${model.aiModel.id}${model.custom ? chalk.yellow('（自定义）') : ''}${cw}`);
+        line('思考', `级别 ${currentThinking} · 过程显示 ${renderer.showThinking ? '开' : '关'}`);
+        line('会话', args.noSession ? '临时（--no-session，退出即失）' : activeKey);
+        line('权限', permission);
+        line('工具', args.noTools ? '已禁用（--no-tools）' : toolSelection.tools.map(t => t.name).join(', '));
+        line('压缩', args.noCompaction ? '禁用（--no-compaction）' : '启用（v2 策略管道，/compact 手动触发）');
+        line('MCP', mcp ? '已配置（/mcp 查看状态）' : '未配置');
+        line('Skills', `${opts.skills?.length ?? 0} 个（/skills 查看）`);
+        line('子agent', `${opts.subagents?.size ?? 0} 个（/agents 查看）`);
+        const memFiles = opts.memoryFiles ?? [];
+        line('记忆', memFiles.length > 0 ? memFiles.join(', ') : '（无）');
         break;
       }
 
@@ -491,18 +705,28 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
         break;
       }
 
-      default:
-        console.log(chalk.yellow(`未知命令: ${cmd}（/help 查看全部）`));
+      default: {
+        // did-you-mean：拼错的命令给出最相似建议（如 /mode → /model）
+        const suggestion = suggestSimilar(cmd, SLASH_COMMANDS);
+        console.log(chalk.yellow(
+          `未知命令: ${cmd}${suggestion ? `（是否想用 ${suggestion}?）` : '（/help 查看全部）'}`,
+        ));
+      }
     }
   }
 
   function printSlashHelp(): void {
     console.log(`${chalk.bold.magenta('斜杠命令:')}
-  ${chalk.green('/model [provider/id]')}      切换模型（无参显示当前）
+  ${chalk.green('/model [provider/id]')}      切换模型（无参弹出选择器）
   ${chalk.green('/thinking <级别>')}         ${chalk.dim('off/minimal/low/medium/high/max')}
+  ${chalk.green('/thinking show [on|off]')}     切换思考过程显示（默认折叠）
   ${chalk.green('/system <文本>')}           替换系统提示词
   ${chalk.green('/session')}                  当前会话信息
   ${chalk.green('/sessions [编号]')}             列出历史会话 / 切换到指定会话
+  ${chalk.green('/sessions rm <编号>')}          删除历史会话（当前会话除外）
+  ${chalk.green('/config')}                   查看当前生效配置总览
+  ${chalk.green('/rename <名称>')}            命名当前会话（列表与恢复时显示）
+  ${chalk.green('/export [文件]')}            导出当前会话为 Markdown
   ${chalk.green('/clear')}                    清空当前会话（仅内存）
   ${chalk.green('/compact')}                  手动压缩会话历史（释放上下文空间）
   ${chalk.green('/tools')}                    查看工具集与权限配置
@@ -519,6 +743,7 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
 
 ${chalk.dim('输入提示:')}
   ${chalk.dim('· 普通文本直接发送；行尾以')} ${chalk.yellow('\\')} ${chalk.dim('续行，空行提交多行')}
+  ${chalk.dim('·')} ${chalk.yellow('Tab')} ${chalk.dim('补全斜杠命令与')} ${chalk.yellow('@文件')} ${chalk.dim('路径')}
   ${chalk.dim('·')} ${chalk.yellow('@文件')} ${chalk.dim('可附加文件上下文（图片自动走多模态）')}`);
   }
 
@@ -616,26 +841,114 @@ ${chalk.dim('输入提示:')}
   await finished;
 }
 
-/** --resume 的会话选择器 */
+/** 「新会话」选项值：控制字符不会出现在真实会话 key 中（sanitizeKey 会 percent-encode） */
+const NEW_SESSION_VALUE = '\u0000new';
+
+/** --resume 的会话选择器：方向键选择（与权限确认一致的交互），Esc/q 取消新建 */
 export async function pickSessionInteractively(
   storage: SessionStorage,
   currentKey: string,
 ): Promise<string | undefined> {
-  const sessions = await listSessionsByRecency(storage);
+  if (!process.stdin.isTTY) {
+    console.log(chalk.dim('非交互终端，跳过会话选择（将新建）'));
+    return undefined;
+  }
+  const sessions = (await listSessionInfos(storage)).slice(0, 10);
   if (sessions.length === 0) {
     console.log(chalk.dim('（无历史会话，将新建）'));
     return undefined;
   }
-  console.log(chalk.bold('选择会话:'));
-  sessions.slice(0, 15).forEach((s, i) => {
-    console.log(`${s === currentKey ? chalk.green('▸ ') : '  '}${i + 1}. ${s}`);
-  });
-  console.log(chalk.dim('  n. 新会话'));
-  const answer = await ask('编号: ');
-  if (answer === '' || answer.toLowerCase() === 'n') return undefined;
-  const idx = Number.parseInt(answer, 10);
-  if (Number.isInteger(idx) && idx >= 1 && idx <= Math.min(sessions.length, 15)) {
-    return sessions[idx - 1];
+  const options: SelectOption[] = sessions.map(s => ({
+    label: `${s.title || s.key}${s.updatedAt ? chalk.dim(`（${formatRelativeTime(s.updatedAt)}）`) : ''}`,
+    value: s.key,
+  }));
+  options.push({ label: '+ 新会话', value: NEW_SESSION_VALUE });
+  // 当前会话预选中；不在列表中时默认第一项
+  const defaultIndex = Math.max(0, sessions.findIndex(s => s.key === currentKey));
+  const picked = await select<string>('选择会话', options, defaultIndex);
+  // Esc/q 取消（null）或选「新会话」→ 新建
+  return picked === null || picked === NEW_SESSION_VALUE ? undefined : picked;
+}
+
+// ─── Tab 补全：文件路径候选 ──────────────────────────────────────
+
+/** 列出 partial 路径的补全候选（目录条目以 / 结尾；隐藏文件仅在 . 前缀时列出） */
+export async function listPathCompletions(partial: string): Promise<string[]> {
+  // 分离目录与前缀：'src/re' → ('src','re')；'src/' → ('src','')；'' → ('.','')
+  const sep = Math.max(partial.lastIndexOf('/'), partial.lastIndexOf('\\'));
+  const dir = sep === -1 ? '.' : (partial.slice(0, sep) || '/');
+  const prefix = sep === -1 ? partial : partial.slice(sep + 1);
+  let entries: import('node:fs').Dirent[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return []; // 目录不存在 / 不可读
   }
-  return undefined;
+  return entries
+    .filter(e => e.name.startsWith(prefix))
+    // 隐藏条目仅在用户显式输入 . 前缀时出现（避免空前缀时列出 .git 等）
+    .filter(e => prefix.startsWith('.') || !e.name.startsWith('.'))
+    .map(e => (e.isDirectory() ? `${e.name}/` : e.name))
+    .sort();
+}
+
+// ─── /export：会话消息 → Markdown ────────────────────────────────
+
+/** 会话消息导出为 Markdown（/export 用；thinking/system 跳过，工具结果折叠） */
+export function buildSessionMarkdown(sessionKey: string, messages: Message[]): string {
+  const lines: string[] = [
+    '# aipack 会话导出',
+    '',
+    `- 会话: ${sessionKey}`,
+    `- 导出时间: ${new Date().toISOString()}`,
+    `- 消息数: ${messages.length}`,
+    '',
+    '---',
+    '',
+  ];
+  for (const m of messages) {
+    if (m.role === 'user') {
+      lines.push('## 用户', '', blocksToText(m.content), '');
+    } else if (m.role === 'assistant') {
+      const parts: string[] = [];
+      if (typeof m.content === 'string') {
+        if (m.content) parts.push(m.content);
+      } else {
+        for (const b of m.content) {
+          if (b.type === 'text' && b.text) parts.push(b.text);
+          else if (b.type === 'toolCall') {
+            parts.push(`> 调用工具 \`${b.name}\`\n> \`\`\`\n> ${JSON.stringify(b.arguments)}\n> \`\`\``);
+          }
+        }
+      }
+      if (parts.length > 0) lines.push('## 助手', '', parts.join('\n\n'), '');
+    } else if (m.role === 'toolResult') {
+      const tm = m as ToolResultMessage;
+      lines.push(
+        `<details><summary>工具结果: ${tm.toolName}${tm.isError ? '（失败）' : ''}</summary>`,
+        '',
+        '```',
+        blocksToText(tm.content) || '(空)',
+        '```',
+        '',
+        '</details>',
+        '',
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
+/** 内容块数组 → 纯文本（image 占位；thinking/toolCall 简要标注） */
+function blocksToText(content: string | Message['content']): string {
+  if (typeof content === 'string') return content;
+  return content
+    .map(b =>
+      b.type === 'text' ? b.text
+      : b.type === 'image' ? '[图片]'
+      : b.type === 'toolCall' ? `[调用 ${b.name}]`
+      : '',
+    )
+    .filter(Boolean)
+    .join('\n');
 }

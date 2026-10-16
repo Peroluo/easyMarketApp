@@ -25,6 +25,8 @@ export interface SessionModel {
 export interface StoredSession {
   key: string;
   version: number;
+  /** 用户命名（/rename 设置）；缺省时消费方回退首条用户消息摘要 */
+  title?: string;
   messages: Message[];
   model: SessionModel | null;
   usage: Usage;

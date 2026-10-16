@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node scripts/run-tests.mjs"
   },
   "keywords": [
     "agent",

@@ -20,9 +20,9 @@
   ],
   "scripts": {
     "build": "tsup",
-    "prebuild": "for p in agent compression mcp; do [ -f ../$p/dist/index.d.ts ] || pnpm --filter @aipack-ai/$p build; done",
+    "prebuild": "node scripts/ensure-deps.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "dev": "tsx src/bin.ts"
   },
   "keywords": [

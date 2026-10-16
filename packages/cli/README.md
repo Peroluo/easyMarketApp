@@ -1,6 +1,6 @@
 # @aipack-ai/cli
 
-基于 [`@aipack-ai/agent`](../agent) 的终端 AI 编程助手。支持交互 REPL、非交互管道与 JSON 事件流三种模式,内置文件读写、shell、检索（find/grep/ls）与 task 子 agent 工具,支持项目记忆文件（AIPACK.md / AGENTS.md / CLAUDE.md）、Skills、MCP、Hooks 与五级上下文压缩;默认权限策略对正常操作零打断、仅危险命令需确认。
+基于 [`@aipack-ai/agent`](../agent) 的终端 AI 编程助手。支持交互 REPL、非交互管道与 JSON 事件流三种模式,内置文件读写、shell、检索（find/grep/ls）与 task 子 agent 工具,支持项目记忆文件（AIPACK.md / AGENTS.md / CLAUDE.md）、Skills、MCP、Hooks 与上下文压缩（策略管道）;默认权限策略对正常操作零打断、仅危险命令需确认。
 
 ```bash
 npm install -g @aipack-ai/cli
@@ -10,7 +10,7 @@ aipack "帮我看看这个项目"
 ## 快速开始
 
 ```bash
-# 任选一个提供商设置 API Key
+# 任选一个提供商设置 API Key（也可直接运行 aipack，无 Key 时交互引导配置）
 export DEEPSEEK_API_KEY=sk-xxx
 
 # 交互模式（REPL）
@@ -105,10 +105,10 @@ JSON 模式输出示例：
 
 | 选项 | 说明 |
 |------|------|
-| `--no-compaction` | 关闭上下文压缩（内置摘要压缩与五级压缩 transformer 均不启用,仅保留硬截断兜底） |
+| `--no-compaction` | 关闭上下文压缩（策略管道与内置摘要压缩均不启用,仅保留硬截断兜底） |
 | `--compaction-config <文件>` | 压缩配置 JSON（叠加在默认配置之上,优先级高于 `aipack.config.js` 的 `compression` 字段） |
 
-默认启用五级压缩,作为 runtime 降级链的第一级(五级压缩 → 内置摘要压缩 → 硬截断):L1 历史裁剪 → L2 摘要 → L3 状态提取 → L4 检查点 → L5 生成交接文档并切换新会话(`aipack --session <新会话>` 可恢复)。`/model` 切换后压缩链自动跟随当前模型。
+默认启用上下文压缩,作为 runtime 降级链的第一级(策略管道 → 内置摘要压缩 → 硬截断):策略管道按预算水位依次执行 trim（裁剪） → summarize（摘要） → truncate（截断）,上下文耗尽时生成交接文档并建议切换到新会话(`aipack --session <新会话>` 可恢复)。`/model` 切换后压缩链自动跟随当前模型。
 
 ### 其他
 
@@ -117,6 +117,7 @@ JSON 模式输出示例：
 | `--system-prompt <文本>` | 替换默认系统提示词 |
 | `--append-system-prompt <文本>` | 追加系统提示词（可多次） |
 | `--max-turns <n>` | 单次请求最大 agentic 回合数（默认 50，也可在 `aipack.config.js` 配置 `maxTurns`） |
+| `--debug` | 显示详细错误与堆栈（或设 `AIPACK_DEBUG=1`）；常见 API/网络错误默认翻译为可行动提示 |
 | `-h, --help` / `-v, --version` | 帮助 / 版本 |
 
 ## 默认权限策略
@@ -149,11 +150,16 @@ JSON 模式输出示例：
 
 | 命令 | 说明 |
 |------|------|
-| `/model [provider/id]` | 切换模型(无参显示当前) |
+| `/model [provider/id]` | 切换模型（无参弹出选择器，仅列已配置 Key 的提供商） |
 | `/thinking <级别>` | 调整思考级别 |
+| `/thinking show [on\|off]` | 切换思考过程显示（开 = 流式输出思考内容，默认折叠为动画） |
 | `/system <文本>` | 替换系统提示词 |
 | `/session` | 当前会话信息 |
-| `/sessions` | 列出历史会话 |
+| `/sessions [编号]` | 列出历史会话 / 切换到指定会话 |
+| `/sessions rm <编号>` | 删除历史会话（当前会话除外） |
+| `/config` | 当前生效配置总览（模型/思考/权限/工具/压缩/MCP/skills/记忆） |
+| `/rename <名称>` | 命名当前会话（列表与 `--resume` 恢复时显示，优先于首条消息摘要） |
+| `/export [文件]` | 导出当前会话为 Markdown（工具结果折叠展示） |
 | `/clear` | 清空当前会话(仅内存) |
 | `/compact` | 手动压缩会话历史（释放上下文空间） |
 | `/tools` | 查看工具集与权限配置 |
@@ -169,11 +175,22 @@ JSON 模式输出示例：
 
 ## 交互体验
 
-- **首次使用引导**：未检测到任何 `*_API_KEY` 时，启动横幅列出提供商与示例 `export` 命令。
+- **首次使用引导**：无任何 `*_API_KEY` 且为 TTY 时，启动即引导选择提供商并输入 Key（保存到 `~/.aipack/env.json`，所有模式生效）；跳过时横幅仍列出示例 `export` 命令。
 - **模型感知提示符**：提示符显示当前模型 ID，如 `aipack deepseek-chat>`。
-- **思考/工具动画**：思考与工具执行期间显示旋转动画（TTY），工具结束时标注成败与耗时。
+- **思考/工具动画**：思考与工具执行期间显示旋转动画（TTY），工具执行显示参数摘要（bash 命令、文件路径），结束时标注成败与耗时。
+- **Tab 补全**：行首 `/` 补全斜杠命令与 `/skill:<名称>`，行尾 `@` 补全文件路径（目录以 `/` 结尾）。
 - **多行输入**：行尾以 `\` 续行，空行提交；续行中按 `Ctrl+C` 取消而非退出。
 - **回合统计**：每轮回复后显示本轮 token、会话累计 token 与本轮使用的工具。
+- **会话可辨识**：`/sessions` 与 `--resume` 列表显示标题（`/rename` 命名或首条消息摘要）与相对时间（如「5 分钟前」），`--resume` 用方向键选择器挑选会话。
+- **输入历史**：`↑`/`↓` 翻阅历史输入，权限确认弹窗后历史不丢失。
+
+## doctor 子命令（环境自检）
+
+```bash
+aipack doctor
+```
+
+逐项检查并给出 ✓ / ⚠ / ✗ 与修复建议：Node 版本、API Key 配置、`aipack.config.js` 加载、`.mcp.json`（项目与全局）结构、会话目录可写性、`~/.aipack/env.json` 持久化变量。存在 ✗ 项时退出码 1，可接入脚本判断。
 
 ## approvals 子命令(跨进程审批)
 
@@ -275,6 +292,8 @@ export default {
 |------|------|
 | `<PROVIDER>_API_KEY` | 提供商 API Key,如 `DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` |
 | `AIPACK_CONFIG_DIR` | 配置目录(默认 `~/.aipack`) |
+
+首次使用引导写入的 Key 保存于 `~/.aipack/env.json`，启动时自动注入（真实环境变量优先，不覆盖）；`aipack doctor` 可查看其状态。
 
 ## 可编程 API
 

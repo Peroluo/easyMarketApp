@@ -44,6 +44,7 @@ export class SessionPersistence {
 
     session.messages = stored.messages;
     session.createdAt = stored.createdAt;
+    session.title = stored.title;
   }
 
   /** 整体保存指定会话（ephemeral 跳过；失败不影响运行结果） */
@@ -53,6 +54,7 @@ export class SessionPersistence {
     const stored: StoredSession = {
       key: sessionKey,
       version: SESSION_VERSION,
+      ...(session.title !== undefined ? { title: session.title } : {}),
       messages: session.messages,
       model: this.deriveModel(session.messages),
       usage: this.sumUsage(session.messages),

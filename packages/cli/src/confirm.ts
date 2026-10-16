@@ -43,13 +43,16 @@ export function isDangerousCommand(command: string): string | null {
 
 export type ToolConfirmChoice = 'once' | 'always' | 'deny';
 
-/** 从工具参数提取简短摘要（bash 显示命令，文件工具显示路径） */
-function summarizeArgs(req: PermissionRequest): string {
-  const args = req.args as Record<string, unknown> | undefined;
+/**
+ * 从工具参数提取简短摘要（bash 显示命令，文件工具显示路径）。
+ * 权限确认与流式渲染（tool_start）共用。
+ */
+export function summarizeArgs(args: unknown): string {
   if (!args || typeof args !== 'object') return '';
-  const cmd = args.command;
+  const a = args as Record<string, unknown>;
+  const cmd = a.command;
   if (typeof cmd === 'string') return cmd.length > 60 ? `${cmd.slice(0, 60)}…` : cmd;
-  const file = args.file ?? args.path;
+  const file = a.file ?? a.path;
   if (typeof file === 'string') return file;
   return '';
 }
@@ -103,7 +106,7 @@ export function createToolConfirmHandler(
     // 危险命令 / 其余需确认的工具：无 TTY 无法弹选择器，保守拒绝
     if (!process.stdin.isTTY) return false;
 
-    const summary = command || summarizeArgs(req);
+    const summary = command || summarizeArgs(args);
     const question = dangerReason
       ? `危险命令（${dangerReason}）：${summary}`
       : summary

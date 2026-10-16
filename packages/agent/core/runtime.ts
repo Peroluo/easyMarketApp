@@ -130,6 +130,12 @@ export interface Runtime {
   clearSession(sessionKey?: string): void;
 
   /**
+   * 设置指定会话的标题并持久化（供 /rename 类操作使用）。
+   * 会话不在内存时先从存储恢复既有内容再写回，不丢失消息。
+   */
+  setSessionTitle(sessionKey: string, title: string): Promise<void>;
+
+  /**
    * 手动压缩指定会话历史（如 /compact 命令）：跳过阈值判断，
    * 直接压缩至 targetRatio 保留量并持久化。
    * 返回压缩模式；compaction 未启用或无可压缩段时返回 null。

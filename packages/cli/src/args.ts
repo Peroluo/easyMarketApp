@@ -34,10 +34,12 @@ export interface Args {
   yes?: boolean;
   /** 单次请求最大 agentic 回合数（默认 50） */
   maxTurns?: number;
-  /** 关闭上下文压缩（内置摘要压缩与五级压缩 transformer 均不启用） */
+  /** 关闭上下文压缩（内置摘要压缩与压缩策略管道 transformer 均不启用） */
   noCompaction?: boolean;
   /** 压缩配置文件路径（JSON，DeepPartial<CompressionConfig> 结构，叠加在默认配置上） */
   compactionConfig?: string;
+  /** 显示详细错误（堆栈）与诊断信息；等价于 AIPACK_DEBUG=1 */
+  debug?: boolean;
   /** 位置参数（用户消息） */
   messages: string[];
   /** @file 引用 */
@@ -49,6 +51,44 @@ const VALID_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'max']
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
   return (VALID_THINKING_LEVELS as readonly string[]).includes(level);
+}
+
+// ─── did-you-mean：未知选项/命令的相似建议 ────────────────────────
+
+/** Levenshtein 编辑距离（O(len·len)，候选集小，性能足够） */
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i];
+    for (let j = 1; j <= n; j++) {
+      curr[j] = Math.min(
+        prev[j] + 1,               // 删除
+        curr[j - 1] + 1,           // 插入
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1), // 替换
+      );
+    }
+    prev = curr;
+  }
+  return prev[n];
+}
+
+/**
+ * 返回与 input 最相似的候选（大小写不敏感）：
+ * 距离 ≤ 2 且小于候选长度（避免极短候选误配一切），无合适者返回 undefined
+ */
+export function suggestSimilar(input: string, candidates: readonly string[]): string | undefined {
+  let best: string | undefined;
+  let bestDist = Infinity;
+  for (const c of candidates) {
+    const d = editDistance(input.toLowerCase(), c.toLowerCase());
+    if (d < bestDist) {
+      bestDist = d;
+      best = c;
+    }
+  }
+  return best !== undefined && bestDist <= 2 && bestDist < best.length ? best : undefined;
 }
 
 export function parseArgs(args: string[]): Args {
@@ -106,6 +146,14 @@ export function parseArgs(args: string[]): Args {
     '-xt': '--exclude-tools',
   };
 
+  /** 布尔/独立选项（did-you-mean 候选，与下方解析分支保持一致） */
+  const BOOLEAN_FLAGS = [
+    '--help', '-h', '--version', '-v', '--continue', '-c', '--resume', '-r',
+    '--no-session', '--no-tools', '-nt', '--safe', '--no-compaction', '--yes', '-y',
+    '--print', '-p', '--list-models', '--debug',
+  ];
+  const allFlags = [...Object.keys(valueFlags), ...BOOLEAN_FLAGS];
+
   for (let i = 0; i < args.length; i++) {
     let arg = args[i];
     // `--` 之后全部视为位置消息（可传递以 - 开头的消息，如 "aipack -- '-p 参数说明'"）
@@ -154,6 +202,8 @@ export function parseArgs(args: string[]): Args {
       result.noCompaction = true;
     } else if (arg === '--yes' || arg === '-y') {
       result.yes = true;
+    } else if (arg === '--debug') {
+      result.debug = true;
     } else if (valueFlags[flag]) {
       // `--` 是选项/消息分隔符，不能作为选项值被消费（否则其后消息全部丢失）
       const next = i + 1 < args.length ? args[i + 1] : undefined;
@@ -173,7 +223,12 @@ export function parseArgs(args: string[]): Args {
     } else if (arg.startsWith('@')) {
       result.fileArgs.push(arg.slice(1));
     } else if (arg.startsWith('-') && arg !== '-') {
-      result.diagnostics.push({ type: 'error', message: `未知选项: ${arg}` });
+      // did-you-mean：拼错的选项给出最相似建议，一次纠正胜过查 help
+      const suggestion = suggestSimilar(arg, allFlags);
+      result.diagnostics.push({
+        type: 'error',
+        message: `未知选项: ${arg}${suggestion ? `（是否想用 ${suggestion}?）` : ''}`,
+      });
     } else {
       result.messages.push(arg);
     }
@@ -225,6 +280,7 @@ ${head('子命令:')}
 ${opt('approvals list', '列出未决审批单')}
 ${opt('approvals approve <id>', '批准审批单')}
 ${opt('approvals deny <id>', '驳回审批单')}
+${opt('doctor', '环境自检（Node / API Key / 配置 / MCP / 会话目录）')}
 ${opt('--list-models [搜索]', '列出可用模型（标注 API Key 配置状态）')}
 
 ${head('模式:')}
@@ -267,12 +323,14 @@ ${head('其他:')}
 ${opt('--max-turns <n>', '单次请求最大 agentic 回合数（默认 50）')}
 ${opt('--system-prompt <文本>', '替换默认系统提示词')}
 ${opt('--append-system-prompt <文本>', '追加系统提示词（可多次）')}
+${opt('--debug', '显示详细错误与堆栈（或设 AIPACK_DEBUG=1）')}
 ${opt('--help, -h', '显示本帮助')}
 ${opt('--version, -v', '显示版本')}
 
 ${head('交互模式:')}
   ${c.dim('· 多行输入：行尾以')} ${c.yellow('\\')} ${c.dim('续行，空行提交')}
-  ${c.dim('· 斜杠命令：/help /model /thinking /clear /compact /sessions /agents /quit')}
+  ${c.dim('· 斜杠命令：/help /model /thinking /sessions /rename /export /compact /quit')}
+  ${c.dim('·')} ${c.yellow('Tab')} ${c.dim('补全斜杠命令与 @ 文件路径')}
   ${c.dim('· Ctrl+C 中断运行，连按两次退出')}
 
 ${head('示例:')}

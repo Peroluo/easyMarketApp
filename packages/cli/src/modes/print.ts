@@ -5,6 +5,7 @@
 import type { Runtime, ResultChunk } from '@aipack-ai/agent';
 import chalk from 'chalk';
 import { ChunkRenderer } from './render.js';
+import { formatErrorForUser } from '../errors.js';
 
 export async function runPrintMode(
   runtime: Runtime,
@@ -21,7 +22,8 @@ export async function runPrintMode(
       renderer.render(chunk);
     }
   } catch (err) {
-    process.stderr.write(chalk.red(`错误: ${err instanceof Error ? err.message : String(err)}\n`));
+    // 错误分级：常见 API/网络错误翻译为可行动提示，--debug 下附堆栈
+    process.stderr.write(chalk.red(`错误: ${formatErrorForUser(err)}\n`));
     process.exitCode = 1;
     return;
   }

@@ -307,6 +307,7 @@ export class RunLoops {
             type: 'tool_start',
             toolName: toolCall.name,
             toolCallId: toolCall.id,
+            args: toolCall.arguments,
           };
         }
 

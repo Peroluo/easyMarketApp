@@ -1130,3 +1130,54 @@ describe('上下文溢出自动恢复', () => {
     assert.equal(retries[0].willRetry, true);
   });
 });
+
+// ─── setSessionTitle（/rename 支撑）────────────────────────────────
+
+describe('setSessionTitle', () => {
+  it('命名持久化且消息保留', async () => {
+    const storage = createMemorySessionStorage();
+    const runtime = createRuntime({ streamFn: textStreamFn('hi'), sessionStorage: storage });
+
+    await runtime.run(createRequest('hello', { sessionKey: 't1' }));
+    await runtime.setSessionTitle('t1', '调试会话');
+
+    const stored = await storage.load('t1');
+    assert.ok(stored, '会话应已持久化');
+    assert.equal(stored!.title, '调试会话');
+    assert.ok(stored!.messages.length >= 2, '既有消息不应丢失');
+  });
+
+  it('后续 persist 不覆盖 title（hydrate/persist 往返）', async () => {
+    const storage = createMemorySessionStorage();
+    const runtime = createRuntime({ streamFn: textStreamFn('hi'), sessionStorage: storage });
+
+    await runtime.run(createRequest('hello', { sessionKey: 't2' }));
+    await runtime.setSessionTitle('t2', '命名 A');
+    // 命名后继续对话：run 结束会 persist 整个会话，title 必须写回
+    await runtime.run(createRequest('again', { sessionKey: 't2' }));
+
+    const stored = await storage.load('t2');
+    assert.equal(stored?.title, '命名 A', '新一轮 persist 后 title 应保留');
+    assert.ok(stored!.messages.length >= 4);
+  });
+
+  it('新 runtime（内存淘汰后）从存储恢复 title 与消息', async () => {
+    const storage = createMemorySessionStorage();
+    const first = createRuntime({ streamFn: textStreamFn('hi'), sessionStorage: storage });
+    await first.run(createRequest('hello', { sessionKey: 't3' }));
+    await first.setSessionTitle('t3', '跨进程标题');
+    await first.close();
+
+    // 模拟新进程：无内存态，setSessionTitle 需先恢复存储内容再写回
+    const second = createRuntime({ streamFn: textStreamFn('hi'), sessionStorage: storage });
+    await second.setSessionTitle('t3', '跨进程标题 v2');
+    const stored = await storage.load('t3');
+    assert.equal(stored?.title, '跨进程标题 v2');
+    assert.ok(stored!.messages.length >= 2, '恢复既有会话时消息不应丢失');
+
+    // hydrate 后 title 对 runtime 可见（loadMessages 触发恢复路径同源）
+    const msgs = await second.loadMessages('t3');
+    assert.ok(msgs.length >= 2);
+    await second.close();
+  });
+});

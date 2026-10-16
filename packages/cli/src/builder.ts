@@ -28,6 +28,7 @@ import type {
   Runtime,
   Tool,
   SessionStorage,
+  StoredSession,
   ApprovalManager,
   PermissionRequest,
   AiModel,
@@ -189,19 +190,67 @@ export interface SessionChoice {
   resumed: boolean;
 }
 
-/** 列出存储中按 updatedAt 降序的会话 key（最多 50 个） */
-export async function listSessionsByRecency(storage: SessionStorage): Promise<string[]> {
+/** 会话列表条目：key + 可读标题 + 更新时间（/sessions、--resume 展示用） */
+export interface SessionInfo {
+  key: string;
+  /** 首条用户消息摘要（前 40 字符）；无用户消息时为空串 */
+  title: string;
+  updatedAt: string;
+}
+
+/** 从会话提取可读标题：/rename 命名的 title 优先，缺省回退首条 user 消息摘要 */
+export function extractSessionTitle(session: StoredSession): string {
+  const named = session.title?.trim();
+  if (named) return named.length > 40 ? `${named.slice(0, 40)}…` : named;
+  for (const m of session.messages) {
+    if (m.role !== 'user') continue;
+    const text = Array.isArray(m.content)
+      ? m.content.flatMap(b => (b.type === 'text' ? [b.text] : [])).join(' ')
+      : m.content;
+    const oneLine = text.replace(/\s+/g, ' ').trim();
+    if (oneLine) return oneLine.length > 40 ? `${oneLine.slice(0, 40)}…` : oneLine;
+  }
+  return '';
+}
+
+/** ISO 时间 → 相对时间描述（刚刚 / N 分钟前 / N 小时前 / 昨天 HH:MM / M月D日 / YYYY-MM-DD） */
+export function formatRelativeTime(iso: string, now = Date.now()): string {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const diff = now - t;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  const d = new Date(t);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) {
+    return `昨天 ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  const today = new Date(now);
+  if (d.getFullYear() === today.getFullYear()) {
+    return `${d.getMonth() + 1}月${d.getDate()}日`;
+  }
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 列出会话信息（按 updatedAt 降序，最多 50 个）；load 失败的条目标题/时间为空 */
+export async function listSessionInfos(storage: SessionStorage): Promise<SessionInfo[]> {
   const keys = await storage.list();
-  // 上限 50：展示（10/15 个）与 -c（1 个）场景足够，避免全量 load 造成无谓开销
+  // 上限 50：展示（10 个）与 -c（1 个）场景足够，避免全量 load 造成无谓开销
   const entries = await Promise.all(
     keys.slice(0, 50).map(async key => {
       const s = await storage.load(key);
-      return { key, updatedAt: s?.updatedAt ?? '' };
+      return { key, title: s ? extractSessionTitle(s) : '', updatedAt: s?.updatedAt ?? '' };
     }),
   );
-  return entries
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    .map(e => e.key);
+  return entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+/** 列出存储中按 updatedAt 降序的会话 key（最多 50 个） */
+export async function listSessionsByRecency(storage: SessionStorage): Promise<string[]> {
+  return (await listSessionInfos(storage)).map(e => e.key);
 }
 
 export async function resolveSessionKey(
@@ -262,12 +311,12 @@ export interface BuiltRuntime {
   approvalManager?: ApprovalManager;
   model: ResolvedModel;
   config: AipackCliConfig;
-  /** 五级压缩转换器（--no-compaction 时为 undefined） */
+  /** 压缩策略管道转换器（--no-compaction 时为 undefined） */
   compressionTransformer?: ContextCompressionTransformer;
   /**
    * 更新压缩链使用的模型（/model 切换时调用）。
    * 压缩 transformer 持有构造时的 streamFn/model 闭包，不更新会导致
-   * 切换模型后 L2/L3/L5 的摘要请求仍走旧模型。
+   * 切换模型后 summarize 的摘要请求仍走旧模型。
    * 注意：contextWindow 在构造时固定，切换后由 runtime 内置压缩兜底。
    */
   setCompressionModel: (aiModel: AiModel) => void;

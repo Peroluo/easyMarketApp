@@ -14,6 +14,8 @@ import { runJsonMode } from './modes/json.js';
 import { runInteractiveMode } from './modes/interactive.js';
 import { readStreamAll } from './prompt.js';
 import { createToolConfirmHandler } from './confirm.js';
+import { runDoctor } from './doctor.js';
+import { runApiKeyOnboarding } from './onboarding.js';
 import { createRequest } from '@aipack-ai/agent';
 import { VERSION } from './version.js';
 
@@ -26,6 +28,11 @@ export async function main(argv: string[]): Promise<number> {
   // ── 子命令：approvals ──
   if (argv[0] === 'approvals' || argv[0] === 'approval') {
     return handleApprovalsCommand(argv.slice(1));
+  }
+
+  // ── 子命令：doctor（环境自检）──
+  if (argv[0] === 'doctor') {
+    return runDoctor();
   }
 
   // ── 参数解析 ──
@@ -88,6 +95,12 @@ export async function main(argv: string[]): Promise<number> {
   const confirmRef: { fn: (req: PermissionRequest) => Promise<boolean> } = {
     fn: req => toolConfirm(req),
   };
+
+  // ── 首次使用引导：交互 TTY 且未传 --api-key 且无任何 Key → 引导配置 ──
+  // （内部自检：已配置任一 provider 时静默返回）
+  if (!isNonInteractive && process.stdin.isTTY && !args.apiKey) {
+    await runApiKeyOnboarding();
+  }
 
   // ── 构建 Runtime ──
   let built;

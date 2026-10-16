@@ -117,6 +117,8 @@ export interface ResultChunk {
   toolName?: string;
   /** 工具调用 ID */
   toolCallId?: string;
+  /** 工具调用参数（tool_start；供前端展示参数摘要，如 bash 命令、文件路径） */
+  args?: unknown;
   /** 是否错误 */
   isError?: boolean;
   /** done 类型：最终 Result 摘要（usage / stopReason / toolsUsed 等，供调用方统计展示） */

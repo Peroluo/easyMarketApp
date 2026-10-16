@@ -70,6 +70,8 @@ export interface SessionState {
   isStreaming: boolean;
   abortController: AbortController | null;
   createdAt: string;   // 会话首次创建时间，持久化时保留
+  /** 用户命名（setSessionTitle 设置；hydrate 恢复，persist 写回） */
+  title?: string;
   hydrated: boolean;   // 是否已从存储恢复（串行化后无竞态）
   /** 串行队列：同一会话的 run/stream 依次执行，避免消息数组交错与 abort 覆盖 */
   queue: Promise<void>;

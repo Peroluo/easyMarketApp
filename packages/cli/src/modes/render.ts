@@ -9,6 +9,8 @@
 import chalk from 'chalk';
 import type { ResultChunk } from '@aipack-ai/agent';
 import { Spinner } from '../spinner.js';
+import { translateApiError } from '../errors.js';
+import { summarizeArgs } from '../confirm.js';
 
 export interface RenderOptions {
   /** 显示思考过程（默认折叠为省略提示） */
@@ -57,16 +59,20 @@ export class ChunkRenderer {
         break;
       }
 
-      case 'tool_start':
-        // 切换动画前缀为工具名，不新增行
+      case 'tool_start': {
+        // 切换动画前缀为工具名 + 参数摘要（bash 命令、文件路径），不新增行
         this.inTool = true;
         this.toolStartedAt = Date.now();
+        const summary = summarizeArgs(chunk.args);
+        const label = chunk.toolName ?? '工具';
+        const summaryStr = summary ? ` ${chalk.dim(truncateOneLine(summary, 48))}` : '';
         if (process.stdout.isTTY) {
-          this.spinner.start(`执行 ${chunk.toolName ?? '工具'}`);
+          this.spinner.start(`执行 ${label}${summaryStr}`);
         } else {
-          status.write(chalk.cyan(`\n⚙ ${chunk.toolName} `));
+          status.write(chalk.cyan(`\n⚙ ${label}${summaryStr} `));
         }
         break;
+      }
 
       case 'tool_end':
         if (this.inTool) {
@@ -84,11 +90,16 @@ export class ChunkRenderer {
         }
         break;
 
-      case 'error':
+      case 'error': {
         this.spinner.stop();
         this.inTool = false;
-        status.write(chalk.red(`\n错误: ${chunk.content ?? '未知错误'}\n`));
+        // 流内错误：已知模式翻译为主信息，原始报错降级为次要行
+        const raw = chunk.content ?? '未知错误';
+        const hint = translateApiError(raw);
+        status.write(chalk.red(`\n错误: ${hint ?? raw}\n`));
+        if (hint) status.write(chalk.dim(`  原始报错: ${raw}\n`));
         break;
+      }
 
       case 'done':
         this.spinner.stop();
@@ -104,6 +115,22 @@ export class ChunkRenderer {
     this.inTool = false;
     this.toolStartedAt = 0;
   }
+
+  /** 当前是否流式显示思考过程（/thinking show 切换） */
+  get showThinking(): boolean {
+    return this.opts.showThinking ?? false;
+  }
+
+  /** 切换思考过程显示（开 = 流式输出思考内容；关 = 折叠为提示动画） */
+  setShowThinking(v: boolean): void {
+    this.opts.showThinking = v;
+  }
+}
+
+/** 单行截断（避免摘要过长导致 spinner 行溢出换行） */
+function truncateOneLine(s: string, max: number): string {
+  const oneLine = s.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
 }
 
 /** 把毫秒格式化为人类可读时长（如 1.2s / 23ms / 1m 05s） */
