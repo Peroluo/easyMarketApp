@@ -195,16 +195,16 @@ DEEPSEEK_API_KEY=sk-xxx npx tsx your-script.ts
 
 | 包                                                                    | 版本  | 定位         |
 | --------------------------------------------------------------------- | ----- | ------------ |
-| [`@aipack-ai/agent`](./packages/agent)                                | 1.1.7 | 框架内核     |
-| [`@aipack-ai/cli`](./packages/cli)                                    | 1.1.7 | 终端助手     |
-| [`@aipack-ai/memory`](./packages/memory)                              | 1.1.7 | 长期记忆插件 |
-| [`@aipack-ai/compression`](./packages/compression)                    | 1.1.7 | 上下文压缩   |
-| [`@aipack-ai/skills`](./packages/skills)                              | 1.1.7 | Skills 插件  |
-| [`@aipack-ai/multi-agent`](./packages/multi-agent)                    | 1.1.7 | 多 Agent 编排 |
-| [`@aipack-ai/mcp`](./packages/mcp)                                    | 1.1.7 | MCP 双向插件 |
-| [`@aipack-ai/observability`](./packages/observability)                | 1.1.7 | 可观测性 SDK |
-| [`@aipack-ai/observability-server`](./packages/observability-server)  | 1.1.7 | 收集服务 + Dashboard |
-| [`@aipack-ai/eval`](./packages/eval)                                  | 1.1.7 | Eval 评测体系 |
+| [`@aipack-ai/agent`](./packages/agent)                                | 1.2.2 | 框架内核     |
+| [`@aipack-ai/cli`](./packages/cli)                                    | 1.2.2 | 终端助手     |
+| [`@aipack-ai/memory`](./packages/memory)                              | 1.2.2 | 长期记忆插件 |
+| [`@aipack-ai/compression`](./packages/compression)                    | 1.2.2 | 上下文压缩   |
+| [`@aipack-ai/skills`](./packages/skills)                              | 1.2.2 | Skills 插件  |
+| [`@aipack-ai/multi-agent`](./packages/multi-agent)                    | 1.2.2 | 多 Agent 编排 |
+| [`@aipack-ai/mcp`](./packages/mcp)                                    | 1.2.2 | MCP 双向插件 |
+| [`@aipack-ai/observability`](./packages/observability)                | 1.2.2 | 可观测性 SDK |
+| [`@aipack-ai/observability-server`](./packages/observability-server)  | 1.2.2 | 收集服务 + Dashboard |
+| [`@aipack-ai/eval`](./packages/eval)                                  | 1.2.2 | Eval 评测体系 |
 
 > 版本号随 Changesets 发布同步更新，以各包 `package.json` 为准。
 
