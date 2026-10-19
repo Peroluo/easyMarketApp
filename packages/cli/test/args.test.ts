@@ -133,3 +133,36 @@ test('选项组合冲突给出警告', () => {
   const d = parseArgs(['--yes', '--safe']);
   assert.ok(d.diagnostics.some(d => d.type === 'warning' && d.message.includes('--yes')));
 });
+
+// ─── --sandbox（M7 工具沙箱基线）─────────────────────────────────
+
+test('--sandbox 合法值：os / subprocess / off', () => {
+  assert.equal(parseArgs(['--sandbox', 'os']).sandbox, 'os');
+  assert.equal(parseArgs(['--sandbox', 'subprocess']).sandbox, 'subprocess');
+  assert.equal(parseArgs(['--sandbox', 'off']).sandbox, 'off');
+  assert.equal(parseArgs(['--sandbox=os']).sandbox, 'os'); // --opt=value 内联
+});
+
+test('--sandbox 缺省不配置（与 off 一致）', () => {
+  assert.equal(parseArgs(['你好']).sandbox, undefined);
+});
+
+test('--sandbox 非法值报 error 诊断（不静默跑错配置）', () => {
+  const a = parseArgs(['--sandbox', 'microvm']);
+  assert.equal(a.sandbox, undefined);
+  const errors = a.diagnostics.filter(d => d.type === 'error');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /无效的沙箱策略 "microvm"。可选: os, subprocess, off/);
+});
+
+test('--sandbox 缺值报错误诊断', () => {
+  const a = parseArgs(['--sandbox']);
+  assert.ok(a.diagnostics.some(d => d.type === 'error' && d.message.includes('--sandbox 需要一个值')));
+});
+
+test('--sandboxx 拼错给出 did-you-mean 建议', () => {
+  const a = parseArgs(['--sandboxx']);
+  assert.ok(a.diagnostics.some(
+    d => d.type === 'error' && d.message.includes('--sandboxx') && d.message.includes('--sandbox'),
+  ));
+});

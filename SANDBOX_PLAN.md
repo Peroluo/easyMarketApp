@@ -673,12 +673,54 @@ seccomp=unconfined）内 Linux 真跑全绿。
 - **allow 告警**：`net.mode 'allow'` 直连时发 `degraded(reason=net-allow-direct)`
   事件提示收敛到 proxy/deny。
 
-### M7 CLI 集成（S）
+### M7 CLI 集成（S）✅ 已完成（2026-10-19，Windows 本机 + Docker Linux 真跑验证通过）
 
 - `aipack --sandbox os|subprocess|off` 启动开关（映射 SandboxOptions）；
 - `aipack doctor` 增加沙箱能力检测（bwrap 可用性 / WSL2 / cgroup v2），
   输出当前生效策略矩阵；
 - 违规事件在 CLI 的用户可见提示（何时该收紧 spec）。
+
+**验收**：CLI 侧 `test/args.test.ts` +6（合法值/内联值/缺省零变化/非法值
+error/缺值/did-you-mean）+ 新增 `test/sandbox-cli.test.ts` 15 用例
+（resolveSandboxOptions 映射 3 + formatSandboxEvent 文案渲染 9 + checkSandbox
+平台条件断言 3）全绿；Windows：CLI 全量 113/113、agent 全量回归 626/626
+（623 pass + 3 Linux-only skip）、双包 typecheck/build、`aipack doctor`
+冒烟（os → subprocess 降级语义）全部通过；Docker（node:20-slim +
+bubblewrap，seccomp=unconfined）Linux 真跑：doctor 沙箱检测（bwrap 可用 +
+cgroup v2/systemd-run 明细 + os→os 矩阵 + WSL2 标注）、agent 全量 634/634
+（628 pass + 6 skip，Linux-only 用例全激活后零失败）、CLI 全量 132/132
+（含 M7 用例）全部通过。
+
+**Linux 真跑暴露并修复的既有测试债务**（`sandbox-subprocess.test.ts`，M4
+遗留，与 M7 改动无关）：
+
+- `createDefaultSandboxProvider` suite 在模块级构造时引用了后置 suite 才
+  初始化的 `toolsModule`（undefined）——Windows 下 `supports('os')` 恒
+  false 掩盖，Linux+bwrap 下 os 路径真进 bwrap.run 时 `dirname(undefined)`
+  崩溃。改为 suite 自建 fixture；
+- `supports('os')` 断言硬编码 false——bwrap 可用环境前提翻转。改为按
+  `probeLinuxSandboxCaps()` 真实探测断言；
+- os 降级链用例在 os 可用时不发生降级（tsx 源码形态 worker 在 bwrap 内
+  亦不可运行）——条件 skip，os 真执行由 sandbox-os.test.ts 的 dist 形态
+  覆盖；
+- `assertPidGone` 在 SIGKILL 后立即探测——单核容器下内核回收进程表项有
+  延迟导致 flaky。加 2s 宽限重试窗口。
+
+**实现说明**（与原设计的细化）：
+
+- `off` 与缺省完全一致（均不设 `RuntimeOptions.sandbox`）——沙箱契约的
+  fail-open 缺省即"关闭"，无需额外状态位，零迁移保证；
+- CLI 不暴露 `enforced` 开关（保持 fail-open 降级语义），spec 收紧经
+  aipack.config.js 或工具声明侧完成；
+- 事件提示仅启用 `--sandbox` 时经 `telemetry.onSandboxEvent` 注册渲染
+  （stderr 黄字单行）：未配置沙箱时每次调用必发
+  degraded(no-sandbox-configured) 属预期基线而非需要提示的事件，渲染会刷屏；
+  spawn/exit 高频生命周期噪声不渲染，仅提示 violation / degraded / killed /
+  limit；
+- doctor 沙箱项不改变退出码语义：仅 subprocess 基线不可用才 warn（os 不可用
+  是预期降级而非故障），策略矩阵项恒 ok；
+- `@aipack-ai/agent` 包根补导出 `probeLinuxSandboxCaps` / `LinuxSandboxCaps`
+  （doctor 平台明细需要布尔 supports 之外的探测面）。
 
 ### M8 池化与性能（S，收尾）
 

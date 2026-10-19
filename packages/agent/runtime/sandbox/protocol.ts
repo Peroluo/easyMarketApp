@@ -7,7 +7,9 @@
  * 生命周期：
  *   宿主 spawn worker → 发 init（toolModules + spec）
  *   → worker 重建工具注册表 + 安装 fs facade + 挂载 secrets API → 回 ready
- *   → 宿主发 exec → worker 执行工具 → 回 result（或 error）→ 自行退出
+ *   → 宿主发 exec → worker 执行工具 → 回 result（或 error）
+ *   →（M8 池化）worker 保持运行等待后续 exec；单次会话由宿主发 shutdown
+ *     或关闭 stdin 使其退出
  *   exec 期间可穿插 broker 交互（M6）：worker 发 request-secret → 宿主回 secret
  *
  * 心跳是协议层消息（独立 op），不是 SandboxEventType 遥测事件：
@@ -34,12 +36,20 @@ export interface InitMessage {
   spec: SandboxSpec;
 }
 
-/** 单请求：worker 查注册表执行工具（每次调用一个 worker，无多请求） */
+/** 单请求：worker 查注册表执行工具（M8 起可多轮复用同一 worker） */
 export interface ExecMessage {
   op: 'exec';
   toolName: string;
   toolCallId: string;
   args: unknown;
+}
+
+/**
+ * 会话终止（M8 池化）：宿主请求 worker 优雅退出（池回收 / 单次会话收尾）。
+ * stdin 关闭（EOF）等效——worker 消费循环读到 done 后自行退出。
+ */
+export interface ShutdownMessage {
+  op: 'shutdown';
 }
 
 /**
@@ -54,7 +64,7 @@ export interface RequestSecretMessage {
   name: string;
 }
 
-export type HostMessage = InitMessage | ExecMessage | SecretMessage;
+export type HostMessage = InitMessage | ExecMessage | SecretMessage | ShutdownMessage;
 
 // ─── worker → 宿主（stdout）────────────────────────────────────────
 

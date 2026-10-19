@@ -203,10 +203,12 @@ export type {
 export {
   createDefaultSandboxProvider,
   SubprocessSandboxProvider,
+  probeLinuxSandboxCaps,
 } from './runtime/sandbox';
 export type {
   DefaultSandboxProviderOptions,
   SubprocessSandboxProviderOptions,
+  LinuxSandboxCaps,
 } from './runtime/sandbox';
 
 // ─── AI 模型层(从 ./ai 选择性重导出,便于单包消费)─────────────────

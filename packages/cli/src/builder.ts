@@ -10,6 +10,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import chalk from 'chalk';
 import {
   createRuntime,
   adaptAiModel,
@@ -34,6 +35,9 @@ import type {
   AiModel,
   PermissionPolicy,
   StreamFn,
+  SandboxOptions,
+  SandboxTelemetryInfo,
+  Telemetry,
 } from '@aipack-ai/agent';
 import { createSkillsPlugin } from '@aipack-ai/skills';
 import type { Skill, SkillDiagnostic } from '@aipack-ai/skills';
@@ -412,6 +416,61 @@ async function buildCompressionTransformer(opts: {
   };
 }
 
+// ─── 工具沙箱（--sandbox os|subprocess|off）──────────────────────
+
+/**
+ * --sandbox → RuntimeOptions.sandbox 映射：
+ * - os / subprocess → 全局策略基线（mergeSpec 收紧语义：工具声明更强时取
+ *   工具侧；平台能力不足时 provider 内部逐级降级 + degraded 遥测，fail-open）；
+ * - off 与缺省 → undefined：不配置沙箱，声明 Tool.sandbox 的工具 inprocess
+ *   直跑 + degraded 遥测告警（与沙箱框架引入后的默认行为一致，零变化）。
+ */
+export function resolveSandboxOptions(args: Args): SandboxOptions | undefined {
+  if (args.sandbox === 'os' || args.sandbox === 'subprocess') {
+    return { defaults: { strategy: args.sandbox } };
+  }
+  return undefined;
+}
+
+/**
+ * 沙箱事件 → 用户可见提示文案（stderr，交互/print/json 模式一致，不影响
+ * stdout 管道与 JSON 流）。violation/degraded/killed 值得用户知情——
+ * 频繁出现的拦截提示"该收紧或调整工具 spec"；spawn/exit 是高频生命周期
+ * 噪声，返回 undefined 不渲染。
+ */
+export function formatSandboxEvent(info: SandboxTelemetryInfo): string | undefined {
+  const d = info.detail ?? {};
+  const tool = String(info.toolName);
+  switch (info.type) {
+    case 'violation': {
+      if (d.kind === 'net') {
+        return `沙箱拦截: 工具 ${tool} 尝试访问未授权主机 ${String(d.host)}（${String(d.method)}，已拦截）`;
+      }
+      if (d.kind === 'secret') {
+        return `沙箱拦截: 工具 ${tool} 请求未声明的凭证 ${String(d.name)}（已拒绝）`;
+      }
+      if (d.op !== undefined && d.path !== undefined) {
+        return `沙箱拦截: 工具 ${tool} 的 ${String(d.op)} 操作越界路径 ${String(d.path)}（已拦截）`;
+      }
+      return `沙箱拦截: 工具 ${tool} 越界操作被拦截（${JSON.stringify(d)}）`;
+    }
+    case 'degraded': {
+      if (d.from !== undefined && d.to !== undefined) {
+        const reason = d.reason !== undefined ? String(d.reason) : '平台能力不足';
+        return `沙箱降级: ${String(d.from)} → ${String(d.to)}（${reason}），工具 ${tool} 以更低隔离强度继续执行`;
+      }
+      const reason = d.reason !== undefined ? String(d.reason) : JSON.stringify(d);
+      return `沙箱降级: 工具 ${tool}（${reason}）`;
+    }
+    case 'killed':
+      return `沙箱强杀: 工具 ${tool} 被终止（${d.reason !== undefined ? String(d.reason) : '超时或资源限额'}）`;
+    case 'limit':
+      return `沙箱限额: 工具 ${tool} 触发资源限额（${JSON.stringify(d)}）`;
+    default:
+      return undefined; // spawn / exit：生命周期噪声，不渲染
+  }
+}
+
 const DEFAULT_APPROVAL_CAPABILITIES = ['fs:write', 'shell:exec'];
 
 export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltRuntime> {
@@ -542,6 +601,17 @@ export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltR
     ...skillsPlugin.extensions,
   ];
 
+  // ── 沙箱（--sandbox os|subprocess；off/缺省不配置，行为零变化）──
+  const sandbox = resolveSandboxOptions(args);
+  // 沙箱事件用户可见提示（stderr）。仅启用沙箱时注册：未配置沙箱时每次调用
+  // 都发 degraded(no-sandbox-configured) 遥测，属于预期基线而非需要提示的事件
+  const sandboxTelemetry: Telemetry | undefined = sandbox === undefined ? undefined : {
+    onSandboxEvent(info) {
+      const message = formatSandboxEvent(info);
+      if (message !== undefined) console.warn(chalk.yellow(`[aipack] ${message}`));
+    },
+  };
+
   const runtime = await createRuntime({
     model: adaptAiModel(model.aiModel),
     streamFn,
@@ -563,6 +633,9 @@ export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltR
     ...(extensions.length > 0 ? { extensions } : {}),
     // --no-compaction 时一并关闭内置摘要压缩（仅保留硬截断兜底）
     compaction: args.noCompaction ? { enabled: false } : { enabled: true },
+    // --sandbox：未配置时不设（零迁移）；provider 由 ToolExecutor 惰性构建
+    ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(sandboxTelemetry !== undefined ? { telemetry: sandboxTelemetry } : {}),
   });
 
   return {

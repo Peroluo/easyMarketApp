@@ -26,6 +26,7 @@ import {
   mergeSpec,
   createDefaultSandboxProvider,
   SubprocessSandboxProvider,
+  probeLinuxSandboxCaps,
   messagesToResources,
   resourcesToMessages,
 } from '../index.ts';
@@ -33,12 +34,20 @@ import { buildWorkerEnv, resolveWorkerPath } from '../runtime/sandbox/subprocess
 import type {
   SandboxEvent,
   SandboxFsSpec,
+  SandboxProvider,
   SandboxResourceSpec,
   SandboxRunRequest,
   SandboxSpec,
 } from '../index.ts';
 
 const execFileAsync = promisify(execFile);
+
+// TEMP-DIAG: 挂死诊断（60s 后仍未退出则打印活跃 handle 后强退）
+const diag = setTimeout(() => {
+  console.error('[diag] still alive after 60s, resources:', process.getActiveResourcesInfo());
+  process.exit(42);
+}, 60_000);
+diag.unref();
 
 // ─── 测试环境 ────────────────────────────────────────────────────────
 
@@ -143,6 +152,9 @@ function makeProvider(overrides?: { heartbeatTimeoutMs?: number; toolModules?: s
     nodeArgs: ['--import', tsxEntryUrl],
     toolModules: overrides?.toolModules ?? [toolsModule],
     heartbeatTimeoutMs: overrides?.heartbeatTimeoutMs,
+    // 本 suite 验证单次会话语义（spawn → exec → exit 事件序列）：
+    // 池化复用（M8）由 sandbox-pool.test.ts 专项覆盖
+    pool: { maxWorkers: 0 },
   });
 }
 
@@ -196,13 +208,22 @@ async function assertPidGone(pid: unknown): Promise<void> {
       `worker pid ${pid} still alive (taskkill /T failed?)`,
     );
   } else {
-    let alive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      alive = false;
+    // 低 CPU 配额环境（如单核容器）下 SIGKILL 后内核回收进程表项有延迟：
+    // 立即探测会误判存活。给 2s 宽限重试，宽限后仍存活才是真失败。
+    const deadline = Date.now() + 2_000;
+    for (;;) {
+      let alive = true;
+      try {
+        process.kill(pid, 0);
+      } catch {
+        alive = false;
+      }
+      if (!alive || Date.now() >= deadline) {
+        assert.ok(!alive, `worker pid ${pid} still alive (process group kill failed?)`);
+        return;
+      }
+      await new Promise(r => setTimeout(r, 100));
     }
-    assert.ok(!alive, `worker pid ${pid} still alive (process group kill failed?)`);
   }
 }
 
@@ -261,16 +282,37 @@ describe('resolveWorkerPath', () => {
 });
 
 describe('createDefaultSandboxProvider（能力探测 + 路由）', () => {
-  const provider = createDefaultSandboxProvider({
-    workerPath: workerTs,
-    nodeArgs: ['--import', tsxEntryUrl],
-    toolModules: [toolsModule],
+  // fixture 自足：模块级共享的 toolsModule 由「SubprocessSandboxProvider 集成」
+  // suite 的 before 初始化，而本 suite 先执行——直接引用会拿到 undefined。
+  // Windows 下 supports('os') 恒 false 掩盖了这点；Linux+bwrap 下 os 路径真进
+  // bwrap.run，undefined toolModule 在 argv 构造（dirname(undefined)）即崩。
+  let provider: SandboxProvider;
+  let fixtureDir: string | undefined;
+
+  before(async () => {
+    fixtureDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'aipack-sbx-dflt-'));
+    const fixtureTools = path.join(fixtureDir, 'tools.mjs');
+    await fs.promises.writeFile(fixtureTools, TOOLS_SOURCE);
+    provider = createDefaultSandboxProvider({
+      workerPath: workerTs,
+      nodeArgs: ['--import', tsxEntryUrl],
+      toolModules: [fixtureTools],
+    });
   });
 
-  it('supports：inprocess/subprocess true；os/microvm false', async () => {
+  after(async () => {
+    if (fixtureDir !== undefined) {
+      await fs.promises.rm(fixtureDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it('supports：inprocess/subprocess true；os 按平台能力；microvm false', async () => {
     assert.equal(await provider.supports('inprocess'), true);
     assert.equal(await provider.supports('subprocess'), true);
-    assert.equal(await provider.supports('os'), false);
+    // os 走真实能力探测（内部构造最小 bwrap 沙箱验证内核路径）：
+    // Linux + bwrap 可用 → true；其余环境（Windows/macOS、无 bwrap Linux）→ false
+    const caps = await probeLinuxSandboxCaps();
+    assert.equal(await provider.supports('os'), process.platform === 'linux' && caps.bwrap);
     assert.equal(await provider.supports('microvm'), false);
   });
 
@@ -285,7 +327,13 @@ describe('createDefaultSandboxProvider（能力探测 + 路由）', () => {
     assert.ok(events.some(e => e.type === 'degraded'));
   });
 
-  it('os 策略降级链：degraded 事件（os→subprocess）后按 subprocess 执行', async () => {
+  it('os 策略降级链：能力不足时 degraded（os→subprocess）后按 subprocess 执行', async t => {
+    // 降级链仅在 os 能力不足环境发生。os 可用（Linux+bwrap）时 run('os')
+    // 直进 bwrap 真执行——本用例的 tsx 源码形态 worker 在 bwrap 内亦不可运行
+    // （tsx loader 不在挂载面），os 真执行由 sandbox-os.test.ts 的 dist 形态覆盖。
+    if (await provider.supports('os')) {
+      return t.skip('os 能力可用：不发生降级（os 真执行见 sandbox-os.test.ts）');
+    }
     const events: SandboxEvent[] = [];
     const result = (await provider.run(makeReq(provider, {
       toolName: 'echo',

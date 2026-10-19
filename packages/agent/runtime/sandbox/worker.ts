@@ -29,6 +29,7 @@ import { createTextContent } from '../../core/types';
 import {
   HEARTBEAT_INTERVAL_MS,
   type ExecMessage,
+  type HostMessage,
   type InitMessage,
   type SecretMessage,
   type WorkerMessage,
@@ -80,6 +81,40 @@ function errorResult(message: string, extra?: Record<string, unknown>): ToolResu
 function exitAfter(code: number): void {
   process.exitCode = code;
   setTimeout(() => process.exit(code), 100).unref();
+}
+
+/** 执行单个 exec 请求（M8 池化：worker 生命周期内可多次调用） */
+async function runExec(exec: ExecMessage, tools: Map<string, Tool>): Promise<void> {
+  execCtx = { toolName: exec.toolName, toolCallId: exec.toolCallId };
+  const tool = tools.get(exec.toolName);
+  if (tool === undefined) {
+    // 闭包/未注册工具：跨进程无法解析（degraded 路径，非静默失败）
+    sendEvent('degraded', {
+      reason: 'tool-not-resolvable',
+      toolName: exec.toolName,
+      hint: 'tools declared with sandbox must be registered from named modules (RuntimeOptions.sandbox.toolModules)',
+    });
+    send({
+      op: 'result',
+      toolResult: errorResult(
+        `Tool "${exec.toolName}" is not available in the sandbox worker: ` +
+        `it is not exported by any configured toolModule. Closure-based tools cannot ` +
+        `be executed in a sandbox; register the tool from a named module and list ` +
+        `that module in RuntimeOptions.sandbox.toolModules.`,
+      ),
+    });
+    return;
+  }
+  let result: ToolResult;
+  try {
+    // abort 语义 = 宿主杀本进程；worker 内不传播软信号
+    result = await tool.execute(exec.toolCallId, exec.args, undefined);
+  } catch (err) {
+    result = errorResult(
+      `sandboxed tool "${exec.toolName}" threw: ${(err as Error)?.message ?? String(err)}`,
+    );
+  }
+  send({ op: 'result', toolResult: result });
 }
 
 // ─── fs facade（Tier 1 软约束，⚠️ 非安全边界）───────────────────────
@@ -316,16 +351,18 @@ function sendEvent(type: SandboxEventType, detail?: Record<string, unknown>): vo
 }
 
 async function main(): Promise<void> {
-  // 心跳立即启动：覆盖 init 等待、toolModules 加载、工具执行全程
+  // 心跳立即启动：覆盖 init 等待、toolModules 加载、工具执行全程；
+  // M8 池化下跨 exec 轮持续（idle 轮也保持，宿主心跳监控持续有效）
   const heartbeat = setInterval(() => send({ op: 'heartbeat' }), HEARTBEAT_INTERVAL_MS);
 
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  const iterator = lines[Symbol.asyncIterator]();
 
-  // ── init 握手 ──
-  const first = await iterator.next();
-  if (first.done) throw new Error('worker stdin closed before init');
-  const init = JSON.parse(first.value as string) as InitMessage;
+  // ── init 握手（第一行必然是 init；readline 缓冲保证行序）──
+  const initLine: string = await new Promise((resolve, reject) => {
+    lines.once('line', resolve);
+    lines.once('close', () => reject(new Error('worker stdin closed before init')));
+  });
+  const init = JSON.parse(initLine) as InitMessage;
   if (init.op !== 'init') throw new Error(`expected init, got "${String(init.op)}"`);
   strategy = init.spec.strategy;
 
@@ -343,64 +380,51 @@ async function main(): Promise<void> {
   }
   send({ op: 'ready' });
 
-  // ── exec 单请求 ──
-  const second = await iterator.next();
-  if (second.done) throw new Error('worker stdin closed before exec');
-  const exec = JSON.parse(second.value as string) as ExecMessage;
-  if (exec.op !== 'exec') throw new Error(`expected exec, got "${String(exec.op)}"`);
-  execCtx = { toolName: exec.toolName, toolCallId: exec.toolCallId };
+  // ── 多轮分发（M8 池化）：行事件模型按 op 分发——
+  //    exec → 串行执行队列（协议单轮语义，前一轮完成才跑下一轮）；
+  //    secret → broker 响应即时分发（工具 await 凭证时队列阻塞在此，
+  //      secret 行直达 handler，broker 不死锁）；
+  //    shutdown → 队列排空后退出（进行中的 exec 不被截断）；
+  //    stdin EOF → readline close → 立即退出（宿主已消失，无可等待）。
+  //    行事件模型天然免锁：不存在多消费者竞争同一 iterator 的取行竞态。──
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearInterval(heartbeat);
+    lines.close(); // 关闭 stdin 读取，事件循环可自然退出（定时器兜底仍在）
+    exitAfter(0);
+  };
 
-  // ── broker 响应消费循环（M6）：exec 期间宿主回发的 SecretMessage 在此分发。
-  //    主流程已不再读 stdin；result 后 lines.close() 使循环随 done 退出 ──
-  const consumeBroker = (async (): Promise<void> => {
-    for (;;) {
-      const next = await iterator.next();
-      if (next.done) return;
-      try {
-        const msg = JSON.parse(next.value as string) as SecretMessage;
-        if (msg !== null && typeof msg === 'object' && msg.op === 'secret') {
-          handleSecretResponse(msg);
-        }
-      } catch {
-        // 畸形行（协议容错）：忽略
-      }
-    }
-  })();
-  void consumeBroker; // 不 await：与工具执行并发，异常面由 unhandledRejection 兜底
-
-  const tool = tools.get(exec.toolName);
-  if (tool === undefined) {
-    // 闭包/未注册工具：跨进程无法解析（degraded 路径，非静默失败）
-    sendEvent('degraded', {
-      reason: 'tool-not-resolvable',
-      toolName: exec.toolName,
-      hint: 'tools declared with sandbox must be registered from named modules (RuntimeOptions.sandbox.toolModules)',
-    });
-    send({
-      op: 'result',
-      toolResult: errorResult(
-        `Tool "${exec.toolName}" is not available in the sandbox worker: ` +
-        `it is not exported by any configured toolModule. Closure-based tools cannot ` +
-        `be executed in a sandbox; register the tool from a named module and list ` +
-        `that module in RuntimeOptions.sandbox.toolModules.`,
-      ),
-    });
-  } else {
-    let result: ToolResult;
+  let execChain: Promise<void> = Promise.resolve();
+  lines.on('line', (line: string) => {
+    if (finished || line.trim() === '') return;
+    let msg: HostMessage;
     try {
-      // abort 语义 = 宿主杀本进程；worker 内不传播软信号
-      result = await tool.execute(exec.toolCallId, exec.args, undefined);
-    } catch (err) {
-      result = errorResult(
-        `sandboxed tool "${exec.toolName}" threw: ${(err as Error)?.message ?? String(err)}`,
-      );
+      msg = JSON.parse(line) as HostMessage;
+    } catch {
+      return; // 畸形行（协议容错）：忽略
     }
-    send({ op: 'result', toolResult: result });
-  }
-
-  clearInterval(heartbeat);
-  lines.close(); // 关闭 stdin 读取，事件循环可自然退出（定时器兜底仍在）
-  exitAfter(0);
+    switch (msg.op) {
+      case 'exec':
+        // 串行队列：池借出语义保证单轮 in-flight，此处队列是防御性串行化
+        execChain = execChain
+          .then(() => runExec(msg, tools))
+          .catch(() => { /* runExec 内已兜底工具异常；此处兜底协议级异常 */ });
+        break;
+      case 'secret':
+        handleSecretResponse(msg as SecretMessage);
+        break;
+      case 'shutdown':
+        // 队列排空后退出：进行中的 exec 完成并发送 result 再退（宿主在等）
+        execChain = execChain.then(() => finish()).catch(() => finish());
+        break;
+    }
+  });
+  lines.once('close', () => {
+    // stdin EOF：宿主销毁（未发 shutdown）/宿主进程退出
+    execChain = execChain.then(() => finish()).catch(() => finish());
+  });
 }
 
 // 兜底：任何未捕获异常快速失败（显式 error 优于让宿主等心跳超时）
