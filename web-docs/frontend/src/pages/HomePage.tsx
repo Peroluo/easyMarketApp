@@ -51,8 +51,8 @@ const features = [
   },
   {
     icon: '🛡️',
-    title: '框架级权限安全',
-    desc: 'PermissionPolicy 统一裁决（deny-by-default + confirm 钩子）+ Tool 能力声明；run_command 无 shell 执行，多语句/管道/重定向一律拒绝。',
+    title: '权限与沙箱双防线',
+    desc: 'PermissionPolicy 统一裁决（deny-by-default + confirm 钩子）+ Tool 能力声明；工具沙箱进程级隔离：fs 白名单、env 白名单、secrets broker、资源限额超限强杀。',
     color: 'linear-gradient(135deg, #fff7ed, #fed7aa)',
   },
 ];
