@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/docs",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "private": true,
   "description": "aipack 框架文档网站 - 包含使用指南、API 文档、扩展教程和示例代码",
   "type": "module",

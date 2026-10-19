@@ -305,10 +305,18 @@ describe('createDefaultSandboxProvider（能力探测 + 路由）', () => {
   it('supports：inprocess/subprocess true；os 按平台能力；microvm false', async () => {
     assert.equal(await provider.supports('inprocess'), true);
     assert.equal(await provider.supports('subprocess'), true);
-    // os 走真实能力探测（内部构造最小 bwrap 沙箱验证内核路径）：
-    // Linux + bwrap 可用 → true；其余环境（Windows/macOS、无 bwrap Linux）→ false
-    const caps = await probeLinuxSandboxCaps();
-    assert.equal(await provider.supports('os'), process.platform === 'linux' && caps.bwrap);
+    // os 走真实能力探测：
+    // - Linux：内部构造最小 bwrap 沙箱验证内核路径，bwrap 可用 → true；
+    // - macOS：Seatbelt（worker 可解析 + sandbox-exec 存在）→ true；
+    // - 其余（Windows、无 bwrap Linux）→ false
+    if (process.platform === 'linux') {
+      const caps = await probeLinuxSandboxCaps();
+      assert.equal(await provider.supports('os'), caps.bwrap);
+    } else if (process.platform === 'darwin') {
+      assert.equal(await provider.supports('os'), fs.existsSync('/usr/bin/sandbox-exec'));
+    } else {
+      assert.equal(await provider.supports('os'), false);
+    }
     assert.equal(await provider.supports('microvm'), false);
   });
 

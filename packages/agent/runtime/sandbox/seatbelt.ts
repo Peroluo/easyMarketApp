@@ -2,8 +2,10 @@
  * runtime/sandbox/seatbelt - Tier 2 macOS OS 沙箱（sandbox-exec / Seatbelt）
  *
  * 与 bwrap 同构（M5：与 M4 共享 provider 接口，仅平台命令生成差异）：
- * - fs：Seatbelt 拒绝式策略——deny default 基线 + 系统/基础设施/工作区
- *   路径逐条 allow；deny 前缀显式拒绝（Seatbelt 取最具体规则优先）；
+ * - fs：Seatbelt 拒绝式策略——deny default 基线 + 读取面全放行（macOS
+ *   初始化期限制：收窄 file-read 会使进程 SIGABRT，真机校准结论，见
+ *   buildSeatbeltProfile）+ 写入面仅 spec.fs.writable / HOME；
+ *   deny 前缀显式拒绝（最具体规则优先，凭证路径读/写双拒）；
  * - net：deny 缺省（deny default 已断网）；allow → (allow network*)；
  *   proxy（M6）→ profile 放行 network-outbound 到宿主 forwarder 的
  *   127.0.0.1:port（Seatbelt 可按 remote 地址强制，比 bwrap 的 env 约定强：
@@ -35,9 +37,6 @@ import { resolveWorkerPath, runProtocolSession, buildWorkerEnv } from './subproc
 const IS_MAC = process.platform === 'darwin';
 /** macOS sandbox-exec 路径（系统自带；Apple 标记 deprecated 但持续可用） */
 export const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
-
-/** 系统只读路径（node/系统库加载基线） */
-const MAC_SYSTEM_READ = ['/usr', '/bin', '/sbin', '/lib', '/etc', '/System'];
 
 export interface SeatbeltProfileOptions {
   /** worker 的 HOME 临时目录（宿主 mkdtemp；profile 需放行读写，工具临时文件落点） */
@@ -71,7 +70,9 @@ export function buildSeatbeltProfile(
     '',
     ';; ── 进程与系统调用基线（node 运行所需；experimental 收敛点见 M5 说明）──',
     '(allow process-exec*)',
-    '(allow process-fork*)',
+    // posix_spawn 内部的 fork 需独立授权；操作名不带星号——"process-fork*"
+    // 是非法形式（unbound variable，profile 被拒加载），真机校准结论
+    '(allow process-fork)',
     '(allow sysctl-read)',
     '(allow ipc-posix*)',
     '(allow mach-lookup)',
@@ -79,20 +80,27 @@ export function buildSeatbeltProfile(
     '(allow file-ioctl)',
   ];
 
-  // ── fs：系统只读 + 基础设施（node/worker/toolModules 所在路径）──
-  for (const p of MAC_SYSTEM_READ) lines.push(`(allow file-read* (subpath "${p}"))`);
+  // ── fs：读取面 ──
+  // 真机校准结论（macOS 15）：按目录收窄 file-read 会在进程初始化期命中未知
+  // 路径读取，直接 SIGABRT（连 /bin/echo 都无法存活；逐目录二分无法补全，
+  // 而 subpath "/" 全放行即正常）。因此读取面全放行，隔离边界收敛到：
+  // - 写入面：file-write* 仅 spec.fs.writable + HOME 临时目录；
+  // - deny 列表：最具体规则优先，凭证路径（~/.ssh 等）读/写双拒。
+  lines.push('(allow file-read* (subpath "/"))');
+  // 基础设施（node/worker/toolModules 所在目录）与 spec.fs.readable 映射保留：
+  // 全局读下为冗余放行，但维持 spec → profile 的语义可追溯（未来若可行再收窄）
   for (const infra of [o.nodeBin, o.workerPath, ...(o.toolModules ?? [])]) {
     lines.push(`(allow file-read* (subpath "${nodePath.dirname(infra)}"))`);
+  }
+  for (const p of spec.fs.readable) {
+    lines.push(`(allow file-read* (subpath "${p}"))`);
   }
 
   // ── HOME 临时目录（读写放行：工具临时文件落点，宿主侧每次调用清理）──
   lines.push(`(allow file-read* (subpath "${o.homePath}"))`);
   lines.push(`(allow file-write* (subpath "${o.homePath}"))`);
 
-  // ── spec.fs 映射：readable 只读 / writable 读写 / deny 显式拒绝（最具体优先）──
-  for (const p of spec.fs.readable) {
-    lines.push(`(allow file-read* (subpath "${p}"))`);
-  }
+  // ── spec.fs 映射：writable 读写 / deny 显式拒绝（最具体优先）──
   for (const p of spec.fs.writable) {
     lines.push(`(allow file-read* (subpath "${p}"))`);
     lines.push(`(allow file-write* (subpath "${p}"))`);

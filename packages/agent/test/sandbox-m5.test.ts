@@ -142,15 +142,18 @@ describe('buildSeatbeltProfile（fs/net/env → profile 映射）', () => {
     assert.equal(lines[0], '(version 1)');
     assert.equal(lines[1], '(deny default)');
     assert.ok(profile.includes('(allow process-exec*)'));
-    assert.ok(profile.includes('(allow process-fork*)'));
+    // posix_spawn 的 fork 需独立授权；操作名不带星号（带星号是非法形式，
+    // sandbox-exec 拒绝加载）—— 真机校准结论，见 seatbelt.ts 注释
+    assert.ok(profile.includes('(allow process-fork)'));
+    assert.ok(!profile.includes('process-fork*'));
     assert.ok(profile.includes('(allow mach-lookup)'));
   });
 
-  it('系统只读 + 基础设施目录 + HOME 临时目录读写', () => {
-    for (const p of ['/usr', '/bin', '/sbin', '/lib', '/etc', '/System']) {
-      assert.ok(profile.includes(`(allow file-read* (subpath "${p}"))`), p);
-    }
-    // node/worker/toolModules 所在目录只读
+  it('读取面全放行（macOS 初始化限制）+ 基础设施目录 + HOME 临时目录读写', () => {
+    // 真机校准：按目录收窄 file-read 会命中初始化期未知路径 → SIGABRT
+    // （/bin/echo 都无法存活），读取面只能全放行；隔离边界在写入面 + deny
+    assert.ok(profile.includes('(allow file-read* (subpath "/"))'));
+    // node/worker/toolModules 所在目录保留映射（全局读下冗余，语义可追溯）
     assert.ok(profile.includes('(subpath "/usr/local/bin")'));
     assert.ok(profile.includes('(subpath "/opt/app/dist/sandbox")'));
     assert.ok(profile.includes('(subpath "/opt/app/tools")'));

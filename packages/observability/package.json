@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/observability",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "aipack 可观测性上报 SDK(S2)：埋点上报模式，appId+appSecret 一行接入，失败本地缓存补报",
   "type": "module",
   "main": "./dist/index.js",
