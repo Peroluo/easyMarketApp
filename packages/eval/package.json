@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/eval",
-  "version": "1.1.10",
+  "version": "1.2.1",
   "description": "aipack Eval 体系：EvalCase 格式 + 规则评分器 + Runner（mock fixture replay）+ 报告与 baseline 门禁",
   "type": "module",
   "main": "./dist/index.js",
