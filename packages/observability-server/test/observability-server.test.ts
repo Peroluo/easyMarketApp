@@ -609,6 +609,8 @@ async function runOnce(telemetry: any, opts: { streamFn: StreamFn; tools?: Tool[
     streamFn: opts.streamFn,
     ...(opts.tools ? { tools: opts.tools } : {}),
     ...(opts.permissionPolicy ? { permissionPolicy: opts.permissionPolicy } : {}),
+    // 本套件验证指标管线而非权限语义：显式放行（运行时默认 fail-closed，未配置策略会拒绝所有工具调用）
+    permissionFailOpen: true,
     telemetry,
   });
   return runtime.run(createRequest('hi'));
@@ -1588,7 +1590,17 @@ describe('P1-1 面板元信息 /api/meta', () => {
 });
 
 describe('P1-3 TLS（HTTPS 传输）', () => {
-  it('createCollectorServer：无 tls → http；带 tls → https，且 HTTPS 上报/查询可用', async () => {
+  it('createCollectorServer：无 tls → http；带 tls → https，且 HTTPS 上报/查询可用', async t => {
+    // openssl 非常驻环境（如 Windows）跳过：证书生成是环境依赖，TLS 语义已在有 openssl 的平台覆盖
+    let opensslOk = false;
+    try {
+      execFileSync('openssl', ['version'], { stdio: 'pipe' });
+      opensslOk = true;
+    } catch {
+      // ENOENT / spawn 失败
+    }
+    if (!opensslOk) return t.skip('openssl 不可用，跳过 HTTPS 传输用例');
+
     const stores = buildStores();
     const collector = createCollector({
       apps: { [APP_ID]: APP_SECRET },

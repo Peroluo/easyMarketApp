@@ -20,7 +20,7 @@
     "build": "tsup",
     "prebuild": "[ -f ../agent/dist/index.d.ts ] || pnpm --filter @aipack-ai/agent build",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node ../../scripts/run-tests.mjs",
     "example": "node --import tsx examples/round-trip.ts"
   },
   "keywords": [

@@ -31,7 +31,7 @@
     "start:win": "powershell -ExecutionPolicy Bypass -File start.ps1",
     "start:sh": "bash start.sh",
     "typecheck": "tsc --noEmit && tsc --noEmit -p web/tsconfig.json",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node ../../scripts/run-tests.mjs",
     "worker": "tsx src/worker/ingest-worker.ts",
     "dev:web": "vite --config web/vite.config.ts"
   },

@@ -128,6 +128,9 @@ async function runCaseOnce(
     tools,
     maxTurns: maxSteps,
     traceIdGenerator: () => sessionKeyFor(c.id, repeat),
+    // eval 聚焦轨迹/输出质量而非权限语义：显式放行（运行时默认 fail-closed，
+    // 未配置策略会拒绝所有工具调用，导致轨迹断言全挂）
+    permissionFailOpen: true,
   });
 
   const sessionKey = sessionKeyFor(c.id, repeat);

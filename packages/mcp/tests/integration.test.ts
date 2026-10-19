@@ -1,16 +1,13 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 import type { RuntimeHooks, ExtensionContext } from '@aipack-ai/agent';
 import { McpClient } from '../src/client/mcp-client';
 import { StdioMcpTransport } from '../src/client/stdio-transport';
 import { createMcpPlugin } from '../src/extension';
 
-const fixturePath = fileURLToPath(
-  pathToFileURL(path.resolve(new URL('.', import.meta.url).pathname, 'fixtures/echo-server.mjs')).href,
-);
+// fileURLToPath 正确处理 Windows 盘符（.pathname 会产生 /D:/ 前缀，resolve 后成双盘符）
+const fixturePath = fileURLToPath(new URL('./fixtures/echo-server.mjs', import.meta.url));
 
 function makeEchoClient(timeoutMs?: number) {
   const transport = new StdioMcpTransport({ command: process.execPath, args: [fixturePath] });

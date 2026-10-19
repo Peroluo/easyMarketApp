@@ -42,13 +42,6 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
-// TEMP-DIAG: 挂死诊断（60s 后仍未退出则打印活跃 handle 后强退）
-const diag = setTimeout(() => {
-  console.error('[diag] still alive after 60s, resources:', process.getActiveResourcesInfo());
-  process.exit(42);
-}, 60_000);
-diag.unref();
-
 // ─── 测试环境 ────────────────────────────────────────────────────────
 
 /** fixture 工具模块（worker 按 toolModules 动态 import 重建注册表） */
@@ -286,6 +279,8 @@ describe('createDefaultSandboxProvider（能力探测 + 路由）', () => {
   // suite 的 before 初始化，而本 suite 先执行——直接引用会拿到 undefined。
   // Windows 下 supports('os') 恒 false 掩盖了这点；Linux+bwrap 下 os 路径真进
   // bwrap.run，undefined toolModule 在 argv 构造（dirname(undefined)）即崩。
+  // 池化 provider 提升到套件作用域：默认池（maxWorkers 3 / idleTtl 60s）的空闲
+  // worker 是活进程，不 close() 会挂住测试进程直至 TTL 兜底
   let provider: SandboxProvider;
   let fixtureDir: string | undefined;
 
@@ -301,6 +296,7 @@ describe('createDefaultSandboxProvider（能力探测 + 路由）', () => {
   });
 
   after(async () => {
+    await (provider as SubprocessSandboxProvider).close?.();
     if (fixtureDir !== undefined) {
       await fs.promises.rm(fixtureDir, { recursive: true, force: true }).catch(() => {});
     }

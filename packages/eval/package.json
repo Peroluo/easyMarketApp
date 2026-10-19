@@ -27,7 +27,7 @@
     "build": "tsc -p tsconfig.build.json && node scripts/fix-imports.mjs",
     "prebuild": "[ -f ../agent/dist/index.d.ts ] || pnpm --filter @aipack-ai/agent build",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node ../../scripts/run-tests.mjs",
     "eval": "node --import tsx src/cli.ts run",
     "eval:live": "node --import tsx src/cli.ts run --mode live"
   },
