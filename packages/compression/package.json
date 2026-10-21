@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/compression",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "aipack 上下文压缩 v2：双水位预算（trigger/target/precompress）+ 策略管道（trim 无损裁剪 -> summarize 有损摘要 -> truncate 保底）+ 后台预压缩 + 上下文耗尽事件",
   "type": "module",
   "main": "./dist/index.js",

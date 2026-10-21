@@ -1,6 +1,6 @@
 {
   "name": "aipack",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "A lightweight personal AI assistant framework",
   "type": "module",
   "scripts": {
