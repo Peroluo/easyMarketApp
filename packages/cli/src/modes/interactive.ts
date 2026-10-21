@@ -124,6 +124,8 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
   let rl!: readline.Interface;
   /** rl.close() 来自"确认前接管"而非退出 */
   let recreating = false;
+  /** 当前 rl 是否存活（'close' 事件维护；@types/node 未声明 Interface.closed） */
+  let rlAlive = false;
   /**
    * 输入历史（↑/↓ 翻阅）：readline 直接 mutate 本数组，
    * 权限确认销毁重建 rl 时传入同一引用，历史得以跨重建保留
@@ -158,6 +160,13 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
   }
 
   function setupRl(): void {
+    // 防御：若旧 rl 仍存活（并发确认交错时可能未走显式 close），先关闭，
+    // 避免 stdin 上残留多个 readline 同时回显按键、重复派发 'line'
+    if (rl && rlAlive) {
+      recreating = true;
+      rl.close();
+      recreating = false;
+    }
     rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -192,10 +201,12 @@ export async function runInteractiveMode(opts: InteractiveOptions): Promise<void
     });
 
     rl.on('close', () => {
+      rlAlive = false;
       if (!recreating) cleanup();
     });
 
     rl.on('line', onLine);
+    rlAlive = true;
     rl.prompt();
   }
 
@@ -810,7 +821,7 @@ ${chalk.dim('输入提示:')}
 
   // ── 权限确认：关 rl → select 接管 → 重建 rl ──
   if (opts.confirmRef) {
-    opts.confirmRef.fn = async (req: PermissionRequest): Promise<boolean> => {
+    const confirmOne = async (req: PermissionRequest): Promise<boolean> => {
       recreating = true;
       rl.close();
       try {
@@ -819,6 +830,18 @@ ${chalk.dim('输入提示:')}
         recreating = false;
         setupRl();
       }
+    };
+    // 并行工具调用（parallelToolCalls 默认开启）可能同时触发多个确认。
+    // 若不串行化：确认 A 的 finally 创建 rl 后，确认 B 的 finally 又创建一个，
+    // A 的 rl 永远不会被 close——每次并发确认泄漏一个 readline 实例，
+    // stdin 上多个 rl 同时消费按键，表现为每个按键回显 N 次、
+    // 回车产生 N 条 'line'（输入被重复排队、任务被执行多次）。
+    let confirmQueue: Promise<unknown> = Promise.resolve();
+    opts.confirmRef.fn = (req: PermissionRequest): Promise<boolean> => {
+      const run = confirmQueue.then(() => confirmOne(req));
+      // 链上吞掉异常，避免一次确认失败卡死后续所有确认
+      confirmQueue = run.then(() => undefined, () => undefined);
+      return run;
     };
   }
 
