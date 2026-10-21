@@ -13,7 +13,6 @@
     "example:agent-memory": "tsx examples/agent-memory.ts",
     "example:compression": "tsx examples/compression-demo.ts",
     "example:permission": "tsx examples/permission-approval.ts",
-    "example:sandbox": "tsx examples/sandbox.ts",
     "example:mcp": "tsx examples/mcp-client.ts",
     "example:mcp-server": "tsx examples/mcp-server.ts",
     "example:ma-pipeline": "tsx examples/multi-agent-pipeline.ts",

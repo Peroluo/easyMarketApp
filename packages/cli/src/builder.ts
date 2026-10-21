@@ -8,10 +8,8 @@
  * 4. 权限策略（fs:read 放行；fs:write / shell:exec 按配置走 confirm 或 pending 审批）
  */
 import fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import chalk from 'chalk';
+import { pathToFileURL } from 'node:url';
 import {
   createRuntime,
   adaptAiModel,
@@ -24,7 +22,6 @@ import {
   createFileSessionStorage,
   createPermissionPolicy,
   createApprovalManager,
-  createDefaultSandboxProvider,
   FileApprovalStore,
 } from '@aipack-ai/agent';
 import type {
@@ -37,9 +34,6 @@ import type {
   AiModel,
   PermissionPolicy,
   StreamFn,
-  SandboxOptions,
-  SandboxTelemetryInfo,
-  Telemetry,
 } from '@aipack-ai/agent';
 import { createSkillsPlugin } from '@aipack-ai/skills';
 import type { Skill, SkillDiagnostic } from '@aipack-ai/skills';
@@ -418,86 +412,6 @@ async function buildCompressionTransformer(opts: {
   };
 }
 
-// ─── 工具沙箱（--sandbox os|subprocess|off）──────────────────────
-
-/**
- * --sandbox → RuntimeOptions.sandbox 映射：
- * - os / subprocess → 全局策略基线（mergeSpec 收紧语义：工具声明更强时取
- *   工具侧；平台能力不足时 provider 内部逐级降级 + degraded 遥测，fail-open）；
- * - off 与缺省 → undefined：不配置沙箱，声明 Tool.sandbox 的工具 inprocess
- *   直跑 + degraded 遥测告警（与沙箱框架引入后的默认行为一致，零变化）。
- */
-export function resolveSandboxOptions(args: Args): SandboxOptions | undefined {
-  if (args.sandbox === 'os' || args.sandbox === 'subprocess') {
-    return { defaults: { strategy: args.sandbox } };
-  }
-  return undefined;
-}
-
-/**
- * CLI 内置工具模块定位（沙箱 worker 按名重建工具注册表用；闭包工具不可跨进程）：
- * - dist 运行：dist/tools.js（tsup 独立 entry，命名导出全部内置工具）；
- *   纯 JS 无需 loader，兼容 Node 18（项目 engines 下限）；
- * - 源码直跑（tsx）回退：src/tools.ts，worker 需 TS loader ——
- *   --import 需 Node ≥ 20.6，低于则用 --loader（deprecated 但可用）；
- * - 都不存在：空模块（声明 sandbox 的工具在 worker 内显式报错，优于静默绕过）。
- */
-function resolveSandboxToolModules(): { toolModules: string[]; nodeArgs: string[] } {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const distTools = path.join(here, 'tools.js');
-  if (existsSync(distTools)) return { toolModules: [distTools], nodeArgs: [] };
-  const srcTools = path.join(here, 'tools.ts');
-  if (existsSync(srcTools)) {
-    // 源码直跑回退：worker 加载 TS 模块需 `--import tsx`（Node ≥ 20.6；
-    // tsx v4 已拒绝 --loader 注入）。更低版本且无 dist 产物 → 空模块
-    //（声明 sandbox 的工具在 worker 内显式报错，优于静默绕过）
-    const [major, minor] = process.versions.node.split('.').map(Number);
-    if (major > 20 || (major === 20 && minor >= 6)) {
-      return { toolModules: [srcTools], nodeArgs: ['--import', 'tsx'] };
-    }
-  }
-  return { toolModules: [], nodeArgs: [] };
-}
-
-/**
- * 沙箱事件 → 用户可见提示文案（stderr，交互/print/json 模式一致，不影响
- * stdout 管道与 JSON 流）。violation/degraded/killed 值得用户知情——
- * 频繁出现的拦截提示"该收紧或调整工具 spec"；spawn/exit 是高频生命周期
- * 噪声，返回 undefined 不渲染。
- */
-export function formatSandboxEvent(info: SandboxTelemetryInfo): string | undefined {
-  const d = info.detail ?? {};
-  const tool = String(info.toolName);
-  switch (info.type) {
-    case 'violation': {
-      if (d.kind === 'net') {
-        return `沙箱拦截: 工具 ${tool} 尝试访问未授权主机 ${String(d.host)}（${String(d.method)}，已拦截）`;
-      }
-      if (d.kind === 'secret') {
-        return `沙箱拦截: 工具 ${tool} 请求未声明的凭证 ${String(d.name)}（已拒绝）`;
-      }
-      if (d.op !== undefined && d.path !== undefined) {
-        return `沙箱拦截: 工具 ${tool} 的 ${String(d.op)} 操作越界路径 ${String(d.path)}（已拦截）`;
-      }
-      return `沙箱拦截: 工具 ${tool} 越界操作被拦截（${JSON.stringify(d)}）`;
-    }
-    case 'degraded': {
-      if (d.from !== undefined && d.to !== undefined) {
-        const reason = d.reason !== undefined ? String(d.reason) : '平台能力不足';
-        return `沙箱降级: ${String(d.from)} → ${String(d.to)}（${reason}），工具 ${tool} 以更低隔离强度继续执行`;
-      }
-      const reason = d.reason !== undefined ? String(d.reason) : JSON.stringify(d);
-      return `沙箱降级: 工具 ${tool}（${reason}）`;
-    }
-    case 'killed':
-      return `沙箱强杀: 工具 ${tool} 被终止（${d.reason !== undefined ? String(d.reason) : '超时或资源限额'}）`;
-    case 'limit':
-      return `沙箱限额: 工具 ${tool} 触发资源限额（${JSON.stringify(d)}）`;
-    default:
-      return undefined; // spawn / exit：生命周期噪声，不渲染
-  }
-}
-
 const DEFAULT_APPROVAL_CAPABILITIES = ['fs:write', 'shell:exec'];
 
 export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltRuntime> {
@@ -628,22 +542,6 @@ export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltR
     ...skillsPlugin.extensions,
   ];
 
-  // ── 沙箱（--sandbox os|subprocess；off/缺省不配置，行为零变化）──
-  const sandbox = resolveSandboxOptions(args);
-  // 沙箱 worker 是独立 node 进程，按 toolModules 按名重建工具注册表（闭包不可达）：
-  // 注入 CLI 内置工具模块与缺省 provider（dev 直跑 TS 源码需 tsx loader）
-  if (sandbox !== undefined) {
-    sandbox.provider = createDefaultSandboxProvider(resolveSandboxToolModules());
-  }
-  // 沙箱事件用户可见提示（stderr）。仅启用沙箱时注册：未配置沙箱时每次调用
-  // 都发 degraded(no-sandbox-configured) 遥测，属于预期基线而非需要提示的事件
-  const sandboxTelemetry: Telemetry | undefined = sandbox === undefined ? undefined : {
-    onSandboxEvent(info) {
-      const message = formatSandboxEvent(info);
-      if (message !== undefined) console.warn(chalk.yellow(`[aipack] ${message}`));
-    },
-  };
-
   const runtime = await createRuntime({
     model: adaptAiModel(model.aiModel),
     streamFn,
@@ -665,9 +563,6 @@ export async function buildRuntime(options: BuildRuntimeOptions): Promise<BuiltR
     ...(extensions.length > 0 ? { extensions } : {}),
     // --no-compaction 时一并关闭内置摘要压缩（仅保留硬截断兜底）
     compaction: args.noCompaction ? { enabled: false } : { enabled: true },
-    // --sandbox：未配置时不设（零迁移）；provider 由 ToolExecutor 惰性构建
-    ...(sandbox !== undefined ? { sandbox } : {}),
-    ...(sandboxTelemetry !== undefined ? { telemetry: sandboxTelemetry } : {}),
   });
 
   return {

@@ -6,15 +6,12 @@ import {
   SettingOutlined,
   RocketOutlined,
   DeploymentUnitOutlined,
-  LockOutlined,
 } from '@ant-design/icons';
 import CodeBlock from '../components/CodeBlock';
 import {
   exMinimalCode,
   exMemoryCode,
   exCompressionCode,
-  exSandboxCode,
-  exSandboxToolsCode,
   exCliConfigCode,
   exMcpClientCode,
   exMcpServerCode,
@@ -27,7 +24,7 @@ export default function ExamplesPage() {
         <CodeOutlined style={{ color: '#6366f1' }} /> 示例代码
       </h1>
       <p className="section-subtitle">
-        精选最常用的场景示例：最小应用、记忆集成、上下文压缩、工具沙箱、CLI 配置文件、MCP 双向接入。
+        精选最常用的场景示例：最小应用、记忆集成、上下文压缩、CLI 配置文件、MCP 双向接入。
         直接复制即可运行（仅需配置 <code>{'<PROVIDER>_API_KEY'}</code> 环境变量）。
       </p>
 
@@ -90,28 +87,7 @@ export default function ExamplesPage() {
 
       <Divider />
 
-      {/* 4. 工具沙箱 */}
-      <div id="sandbox" style={{ scrollMarginTop: 100 }}>
-        <h2 className="subsection-title">
-          <LockOutlined /> 工具沙箱（Tool.sandbox 隔离执行）
-        </h2>
-        <p style={{ lineHeight: 1.8, color: '#475569' }}>
-          声明了 <code>Tool.sandbox</code> 的工具在独立 worker 进程内执行：fs 前缀白名单 + deny 显式拒绝、
-          env 白名单注入（不继承宿主）、secrets 凭证按需单条发放、资源限额超限强杀进程树。
-          与权限层正交——<b>权限 = 事前授权（fail-closed），沙箱 = 事中约束（fail-open 降级 + 告警）</b>。
-          注意声明沙箱的工具必须放在可被 worker 重新 import 的命名模块中（闭包工具无法跨进程）。
-          完整可运行示例见仓库 <code>examples/sandbox.ts</code>（脚本化模型，无需 API Key）。
-        </p>
-        <CodeBlock code={exSandboxCode} />
-        <p style={{ lineHeight: 1.8, color: '#475569', marginTop: 16 }}>
-          工具模块（<code>toolModules</code> 指向，宿主注册声明、worker 按名执行）：
-        </p>
-        <CodeBlock code={exSandboxToolsCode} />
-      </div>
-
-      <Divider />
-
-      {/* 5. CLI 配置 */}
+      {/* 4. CLI 配置 */}
       <div id="cli" style={{ scrollMarginTop: 100 }}>
         <h2 className="subsection-title">
           <SettingOutlined /> aipack.config.js（CLI 配置）

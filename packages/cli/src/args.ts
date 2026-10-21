@@ -40,12 +40,6 @@ export interface Args {
   compactionConfig?: string;
   /** 显示详细错误（堆栈）与诊断信息；等价于 AIPACK_DEBUG=1 */
   debug?: boolean;
-  /**
-   * 工具沙箱策略基线：os（OS 级隔离，能力不足自动降级）/
-   * subprocess（跨进程基线）/ off（关闭，与缺省一致）。
-   * 仅影响声明了 Tool.sandbox 的工具，未声明者行为零变化。
-   */
-  sandbox?: 'os' | 'subprocess' | 'off';
   /** 位置参数（用户消息） */
   messages: string[];
   /** @file 引用 */
@@ -143,16 +137,6 @@ export function parseArgs(args: string[]): Args {
       else result.diagnostics.push({ type: 'error', message: `无效的 --max-turns: ${v}（需为正整数）` });
     },
     '--compaction-config': v => { result.compactionConfig = v; },
-    '--sandbox': v => {
-      if (v === 'os' || v === 'subprocess' || v === 'off') result.sandbox = v;
-      else {
-        // 与 --thinking/--mode 的无效值处理一致：报错退出（而非静默跑错配置）
-        result.diagnostics.push({
-          type: 'error',
-          message: `无效的沙箱策略 "${v}"。可选: os, subprocess, off`,
-        });
-      }
-    },
   };
 
   /** 短选项 → 等价长选项（带值） */
@@ -296,7 +280,7 @@ ${head('子命令:')}
 ${opt('approvals list', '列出未决审批单')}
 ${opt('approvals approve <id>', '批准审批单')}
 ${opt('approvals deny <id>', '驳回审批单')}
-${opt('doctor', '环境自检（Node / API Key / 配置 / MCP / 会话目录 / 沙箱）')}
+${opt('doctor', '环境自检（Node / API Key / 配置 / MCP / 会话目录）')}
 ${opt('--list-models [搜索]', '列出可用模型（标注 API Key 配置状态）')}
 
 ${head('模式:')}
@@ -324,7 +308,6 @@ ${opt('--exclude-tools, -xt <列表>', '工具黑名单（逗号分隔）')}
 ${opt('--no-tools, -nt', '禁用全部工具')}
 ${opt('--safe', '保守模式：写文件/shell 全部人工确认')}
 ${opt('--yes, -y', '自动批准一切（含危险命令），CI/管道用')}
-${opt('--sandbox <策略>', '工具沙箱基线: os / subprocess / off（能力不足自动降级）')}
 
   ${c.dim('内置工具:')} read · write · edit · bash · find · grep · ls · task
   ${c.dim('task 工具:')} 启动子 agent（隔离上下文执行子任务并返回报告，

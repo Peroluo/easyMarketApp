@@ -5,8 +5,6 @@
  * 供框架级 PermissionPolicy 裁决（如 fs:write → confirm / pending）。
  */
 import fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { Tool, ToolResult } from '@aipack-ai/agent';
@@ -314,35 +312,6 @@ export const bashTool: Tool = {
     required: ['command'],
   },
   permissions: ['shell:exec'],
-  /**
-   * 沙箱声明（--sandbox 启用时进入隔离链路；未配置时降级 inprocess，行为零变化）。
-   * strategy 'os'：只有 OS 级沙箱（macOS Seatbelt / Linux bwrap，内核强制）能约束
-   * bash spawn 出的任意子进程——subprocess 层的 fs facade 只 patch worker 内
-   * node:fs，拦不住 shell 子进程的 syscall。
-   * - readable：工作区 + 用户工具链目录（/usr /bin /etc 等系统路径由 provider
-   *   基线放行；不存在的路径过滤掉，避免 bwrap 绑定报错）；
-   * - writable：仅工作区 —— 工作区外的写入/删除（如仓库根 package.json）被内核拒绝；
-   * - deny：凭证类路径，优先级高于白名单（deny 最具体规则优先）；
-   * - net：deny-by-default（与框架语义一致），需要联网构建时显式放宽为 'allow'；
-   * - env 注意：worker PATH 由框架保留（/usr/local/bin:/usr/bin:/bin:nodeDir），
-   *   spec.env 不可覆盖 —— 非系统目录的工具链（如 homebrew pnpm）在沙箱内不可用。
-   */
-  sandbox: (_args, { workspace }) => {
-    const root = workspace ?? process.cwd();
-    return {
-      strategy: 'os',
-      fs: {
-        readable: [root, '/opt/homebrew', '/usr/local'].filter(p => existsSync(p)),
-        writable: [root],
-        deny: [
-          path.join(os.homedir(), '.ssh'),
-          path.join(os.homedir(), '.gnupg'),
-          path.join(root, '.env'),
-        ],
-      },
-      net: { mode: 'deny' },
-    };
-  },
   async execute(_id, rawArgs) {
     const args = rawArgs as { command: string; timeoutMs?: number };
     // 钳制超时：模型可能传 0/负数（命令刚启动就被杀）或 Infinity（永不超时）

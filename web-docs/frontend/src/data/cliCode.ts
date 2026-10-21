@@ -278,35 +278,6 @@ export const cliPermissionCode = [
   '#   approvals.enabled → pending（异步审批）；否则 → confirm（内联确认）',
 ].join('\n');
 
-export const cliSandboxCode = [
-  '# ===== 工具沙箱：--sandbox 基线（默认 off，零迁移）=====',
-  '',
-  '# 声明了 Tool.sandbox 的内置/插件工具在隔离环境中执行；未声明的工具不受影响',
-  '# 权限 = 事前授权（fail-closed），沙箱 = 事中约束（能力不足自动降级 + 告警）',
-  '',
-  'aipack --sandbox subprocess -p "分析项目"   # 进程隔离基线（跨平台，worker 池化复用）',
-  'aipack --sandbox os -p "分析项目"          # OS 级隔离基线：Linux bwrap / macOS Seatbelt',
-  'aipack --sandbox off -p "..."              # 显式关闭（默认值）',
-  '',
-  '# ===== 沙箱内约束（工具声明与基线合并，只收紧不放宽）=====',
-  '#   fs        readable/writable 前缀白名单（缺省回填工作区根）+ deny 显式拒绝',
-  '#   net       deny / allow / proxy（域名白名单）',
-  '#   env       显式注入，不继承宿主环境（PATH/HOME 等保留键不可覆盖）',
-  '#   secrets   凭证白名单：按需单条发放，未声明的请求被拒绝并告警',
-  '#   resources wallClockMs / memoryMb / outputBytes ... 超限强杀整个进程树',
-  '',
-  '# ===== 降级链与 doctor =====',
-  '#   隔离强度 inprocess < subprocess < os < microvm（未实现）',
-  '#   能力不足逐级降级并提示，如：沙箱降级: os → subprocess（bwrap 不可用）',
-  '#   违规/限额事件写 stderr，如：沙箱违规: 路径越界 write /etc/hosts',
-  '',
-  'aipack doctor                              # 环境自检：沙箱能力探测 + 策略降级矩阵',
-  '#   沙箱能力      bwrap 可用 · cgroup v2 ✓ · systemd-run 配额 ✗   （Linux）',
-  '#                 Seatbelt(sandbox-exec) 可用                      （macOS）',
-  '#                 Windows 无 OS 级沙箱，声明 os 的工具自动降级 subprocess',
-  '#   沙箱策略矩阵  os → os · subprocess → subprocess · microvm → 未实现',
-].join('\n');
-
 export const cliApiCode = [
   'import {',
   '  parseArgs,',
@@ -359,7 +330,4 @@ export const cliEnvCode = [
   '',
   '# bash 工具子进程环境变量白名单透传（API Key 不泄露给 shell 命令）；',
   '# 需要向命令暴露自定义变量时使用 AIPACK_ 前缀（自动透传）',
-  '',
-  '# 沙箱 worker 入口覆盖（默认自动解析包内 dist 产物，一般无需设置）',
-  'export AIPACK_SANDBOX_WORKER=/path/to/worker.js',
 ].join('\n');

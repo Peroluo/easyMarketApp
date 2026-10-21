@@ -9,17 +9,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import chalk from 'chalk';
-import {
-  getBuiltinProviders,
-  hasProviderConfigured,
-  createDefaultSandboxProvider,
-  probeLinuxSandboxCaps,
-} from '@aipack-ai/agent';
+import { getBuiltinProviders, hasProviderConfigured } from '@aipack-ai/agent';
 import { defaultConfigDir, defaultSessionDir, VERSION } from './version.js';
 import { persistedEnvPath } from './onboarding.js';
 
 /** 单项检查结果 */
-export interface CheckResult {
+interface CheckResult {
   status: 'ok' | 'warn' | 'fail';
   label: string;
   detail: string;
@@ -140,79 +135,6 @@ async function checkPersistedEnv(): Promise<CheckResult | null> {
   }
 }
 
-// ─── 沙箱能力检测（--sandbox / Tool.sandbox 隔离链路）─────────────
-
-/** WSL2 环境检测（Linux 下 /proc/version 含 microsoft 标志；bwrap 兼容性特殊，注明供排查） */
-async function isWsl2(): Promise<boolean> {
-  try {
-    const version = await fs.readFile('/proc/version', 'utf-8');
-    return version.toLowerCase().includes('microsoft');
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 沙箱能力检测 + 当前生效策略矩阵。
- * - supports 走 provider 真探测（Linux 内部构造最小 bwrap 沙箱验证
- *   userns/mountns 内核路径，容器环境常封锁 unprivileged userns，
- *   --version 式假探测会误报，见 bwrap.ts probeBwrapSandbox）；
- * - 策略矩阵 = 声明策略 → 实际生效策略（fail-open 逐级降级：
- *   microvm → os → subprocess → inprocess）。
- */
-export async function checkSandbox(): Promise<CheckResult[]> {
-  let osSupported = false;
-  let subprocessSupported = false;
-  try {
-    const provider = createDefaultSandboxProvider();
-    [osSupported, subprocessSupported] = await Promise.all([
-      provider.supports('os'),
-      provider.supports('subprocess'),
-    ]);
-  } catch (err) {
-    return [
-      { status: 'warn', label: '沙箱能力', detail: `探测失败: ${errMessage(err)}` },
-    ];
-  }
-
-  // 平台明细（bwrap / cgroup v2 / systemd-run 配额、Seatbelt、Windows 降级语义）
-  let detail: string;
-  if (process.platform === 'linux') {
-    const caps = await probeLinuxSandboxCaps();
-    detail =
-      `bwrap ${caps.bwrap ? '可用' : '不可用'} · cgroup v2 ${caps.cgroupV2 ? '✓' : '✗'}` +
-      ` · systemd-run 配额 ${caps.quota ? '✓' : '✗'}` +
-      ((await isWsl2()) ? ' · WSL2 环境' : '');
-  } else if (process.platform === 'darwin') {
-    detail = `Seatbelt(sandbox-exec) ${osSupported ? '可用' : '不可用'}`;
-  } else {
-    detail = 'Windows 无 OS 级沙箱，声明 os 的工具自动降级 subprocess（worker 进程隔离）';
-  }
-
-  // subprocess 是跨平台基线（worker 入口可解析即隔离链路可用）；
-  // os 不可用是预期降级而非故障，subprocess 也不可用才值得提醒
-  const capability: CheckResult = {
-    status: subprocessSupported ? 'ok' : 'warn',
-    label: '沙箱能力',
-    detail: subprocessSupported
-      ? detail
-      : `${detail} · worker 入口不可用，声明沙箱的工具将 inprocess 直跑`,
-  };
-
-  // 策略矩阵：声明 → 实际生效
-  const osActual = osSupported ? 'os' : subprocessSupported ? 'subprocess' : 'inprocess';
-  const subprocessActual = subprocessSupported ? 'subprocess' : 'inprocess';
-  const matrix: CheckResult = {
-    status: 'ok',
-    label: '沙箱策略矩阵',
-    detail:
-      `os → ${osActual} · subprocess → ${subprocessActual} · microvm → 未实现` +
-      ' · 未声明沙箱的工具 inprocess 直跑（默认 fail-open 降级）',
-  };
-
-  return [capability, matrix];
-}
-
 // ─── 聚合输出 ────────────────────────────────────────────────────
 
 export async function runDoctor(cwd: string = process.cwd()): Promise<number> {
@@ -226,7 +148,6 @@ export async function runDoctor(cwd: string = process.cwd()): Promise<number> {
     (await checkMcpConfig(path.join(defaultConfigDir(), 'mcp.json')))!,
     await checkSessionDir(cwd),
     (await checkPersistedEnv())!,
-    ...(await checkSandbox()),
   ].filter((r): r is CheckResult => r !== null);
 
   for (const r of results) {

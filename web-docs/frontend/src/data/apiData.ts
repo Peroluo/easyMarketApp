@@ -37,8 +37,7 @@ export const apiList: ApiItem[] = [
       { name: 'options.transformers', type: 'ContextTransformer[]', description: '预注册的上下文转换器，按数组顺序链式执行（上一个输出作为下一个输入）' },
       { name: 'options.sessionStorage', type: 'SessionStorage', description: '会话存储适配器，启用后会话自动持久化' },
       { name: 'options.maxSessions', type: 'number', description: '内存会话上限，超限按 LRU 淘汰最久未用会话（默认 256）。仅影响内存态，持久化会话不受影响' },
-      { name: 'options.permissionPolicy', type: 'PermissionPolicy', description: '框架级工具权限策略（可选）。未配置时默认 fail-closed（所有工具调用被拒绝），生产环境建议配置 createPermissionPolicy / createAllowListPolicy；deny 产出 details.blocked 结果、不终止 run，模型可换策略。check 可返回 pending 走异步审批通道（需配置 approvals）' },
-      { name: 'options.permissionFailOpen', type: 'boolean', description: '未配置 permissionPolicy 时是否放行工具执行（显式 opt-in，默认 false = 拒绝）。安全姿态：框架默认不裸奔执行任意工具；确需旧行为（全部放行）时显式设为 true，或直接配置 createAllowAllPolicy()' },
+      { name: 'options.permissionPolicy', type: 'PermissionPolicy', description: '框架级工具权限策略（可选）。未配置时全部放行（向后兼容），生产环境建议配置；deny 产出 details.blocked 结果、不终止 run，模型可换策略。check 可返回 pending 走异步审批通道（需配置 approvals）' },
       { name: 'options.approvals', type: 'ApprovalManager', description: '审批管理器（Human-in-the-loop，可选）。permissionPolicy 返回 pending 时，Runtime 挂起工具调用并创建审批单，外部任意时机 resolve(id, true/false) 恢复执行；未配置时 pending 视为 deny。由 createApprovalManager 创建' },
       { name: 'options.approvalTimeoutMs', type: 'number', description: '审批等待超时毫秒数（默认 300000 = 5 分钟）。超时审批单以 timeout 结算，对应工具调用被拒绝（保守）' },
       { name: 'options.telemetry', type: 'Telemetry', description: '轻量可观测：onRunEnd / onToolCall / onModelCall / onRetry / onCompaction 等，全可选、上报失败不影响主流程' },
@@ -49,7 +48,6 @@ export const apiList: ApiItem[] = [
       { name: 'options.maxResources', type: 'number', description: '上下文资源条数上限，默认 200（TruncationTransformer）' },
       { name: 'options.contextBudgetRatio', type: 'number', description: 'token 预算占 contextWindow 的比例，默认 0.8' },
       { name: 'options.compaction', type: 'CompactionOptions', description: '内置摘要压缩（可选）：token 超阈值时 LLM 摘要旧历史替换为 compactionSummary 消息，失败降级硬截断；未配置保持旧行为。详见 CompactionOptions 条目' },
-      { name: 'options.sandbox', type: 'SandboxOptions', description: '工具执行沙箱隔离层（可选，与 PermissionPolicy 正交：权限=事前授权 fail-closed，沙箱=事中约束 fail-open 降级+告警）。未配置时声明了 Tool.sandbox 的工具降级 inprocess 直跑并发遥测告警（行为零变化）。详见"工具沙箱"分类' },
     ],
     returns: 'Runtime 实例，可调用 run/stream/registerTool 等方法',
     example: `import {
@@ -1075,141 +1073,6 @@ const runtime = createRuntime({
   // ... 其他配置
   permissionPolicy: createAllowAllPolicy(), // 测试场景：全部放行
 });`,
-  },
-
-  // ========== 工具沙箱 ==========
-  {
-    id: 'Tool-sandbox',
-    name: 'Tool.sandbox 沙箱声明',
-    kind: 'type',
-    signature: "Tool { sandbox?: Partial<SandboxSpec> | ((args, ctx: ToolSandboxContext) => Partial<SandboxSpec>) }",
-    description: '工具声明自身运行所需的隔离规格：静态 Partial<SandboxSpec> 或按入参动态生成的工厂函数（可读取 ToolSandboxContext，如 workspace）。未声明 sandbox 的工具不进隔离链路，行为零变化（零迁移保证）。运行时会与 RuntimeOptions.sandbox.defaults 按"只收紧不放宽"语义合并（mergeSpec）：strategy 取更强、fs 白名单取交集、deny 取并集、net 取更严、资源限额逐字段取 min。',
-    category: '工具沙箱',
-    example: `import type { Tool } from '@aipack-ai/agent';
-
-// 静态声明：fs 白名单 + 显式拒绝（deny 优先级最高）+ 资源限额
-const escapeRead: Tool = {
-  name: 'escape_read',
-  description: '读取文件（隔离执行）',
-  parameters: Type.Object({ path: Type.String() }),
-  permissions: ['fs:read'],
-  sandbox: {
-    strategy: 'subprocess',
-    fs: { readable: [WORKSPACE], writable: [WORKSPACE], deny: ['~/.ssh', './.env'] },
-    net: { mode: 'deny' },
-    resources: { wallClockMs: 30_000, outputBytes: 64 * 1024 },
-  },
-  async execute(_id, args) { /* ... */ },
-};
-
-// 动态声明：按入参生成规格
-const declared = (args) => ({ fs: { readable: [args.dir] } });`,
-  },
-  {
-    id: 'SandboxSpec',
-    name: 'SandboxSpec 沙箱规格',
-    kind: 'interface',
-    signature: 'interface SandboxSpec { strategy?, fs?, net?, env?, resources?, secrets? }',
-    description: '沙箱完备规格。strategy：隔离强度递增 inprocess < subprocess < os < microvm（能力不足按链逐级降级，每级发 degraded 事件；enforced 严格模式禁止降级）。fs：readable/writable 前缀白名单（缺省回填 workspace 根）+ deny 显式拒绝（优先级最高，如 ~/.ssh、.env）。net：mode deny | allow | proxy（proxy 用 hosts 域名白名单）。env：显式注入，不继承宿主环境（框架保留键 PATH/HOME 等不可覆盖）。resources：wallClockMs / cpuMs / memoryMb / processes / outputBytes / diskWriteBytes 可选上限。secrets：凭证请求白名单，worker 内经 globalThis["__aipackSandbox"].requestSecret(name) 按需单条发放。',
-    category: '工具沙箱',
-    params: [
-      { name: 'strategy', type: "'inprocess' | 'subprocess' | 'os' | 'microvm'", description: '隔离策略；缺省回填 subprocess（真实进程隔离）' },
-      { name: 'fs', type: 'SandboxFsSpec', description: 'readable/writable 前缀白名单 + deny 显式拒绝' },
-      { name: 'net', type: 'SandboxNetSpec', description: "mode: 'deny' | 'allow' | 'proxy'；proxy 模式 hosts 域名白名单（未提供 = 全拒）" },
-      { name: 'env', type: 'Record<string, string>', description: '显式注入的环境变量（不继承宿主；框架保留键不可覆盖）' },
-      { name: 'resources', type: 'SandboxResourceSpec', description: 'wallClockMs / cpuMs / memoryMb / processes / outputBytes / diskWriteBytes 上限，超限强杀' },
-      { name: 'secrets', type: 'string[]', description: '凭证请求白名单；未声明的凭证名请求会被拒绝并发 violation 事件' },
-    ],
-    example: `import { mergeSpec } from '@aipack-ai/agent';
-
-// 运行时基线与工具声明合并：只收紧、不放宽（fs 交集 / deny 并集 / 资源取 min）
-const effective = mergeSpec(
-  { resources: { wallClockMs: 30_000 }, net: { mode: 'deny' } },  // Runtime defaults
-  { strategy: 'subprocess', fs: { readable: ['./src'] } },         // Tool.sandbox 解析结果
-  workspace,
-);`,
-  },
-  {
-    id: 'SandboxOptions',
-    name: 'SandboxOptions 运行时沙箱配置',
-    kind: 'interface',
-    signature: 'RuntimeOptions { sandbox?: { provider?, defaults?, enforced?, toolModules? } }',
-    description: 'createRuntime 的沙箱配置。defaults 为全局基线规格（经 mergeSpec 只能比工具声明更严）；enforced 严格模式在 provider 能力不足时直接拒绝（[blocked] 结果）而非降级；provider 未提供时惰性构建 createDefaultSandboxProvider；toolModules 为 worker 需要加载的工具模块路径——声明了 Tool.sandbox 的工具必须来自可被 worker 重新 import 的命名模块（闭包工具无法跨进程，worker 内查不到工具会发 degraded 事件并返回错误结果）。与 PermissionPolicy 正交：权限=事前授权，沙箱=事中约束。',
-    category: '工具沙箱',
-    params: [
-      { name: 'provider', type: 'SandboxProvider', description: '沙箱 provider（supports(strategy) 能力探测 + run(req) 执行）；缺省自动构建' },
-      { name: 'defaults', type: 'Partial<SandboxSpec>', description: '全局基线规格，与工具声明按收紧语义合并' },
-      { name: 'enforced', type: 'boolean', description: '严格模式：能力不足时拒绝执行而不是降级（默认 false = 降级 + 告警）' },
-      { name: 'toolModules', type: 'string[]', description: 'worker 加载的工具模块路径（声明沙箱的工具须放在可被重新 import 的模块中）' },
-    ],
-    example: `import {
-  createRuntime, createRequest, SubprocessSandboxProvider,
-} from '@aipack-ai/agent';
-
-const provider = new SubprocessSandboxProvider({
-  nodeArgs: ['--import', import.meta.resolve('tsx')],  // 工具模块为 TS 时需 loader
-  toolModules: ['./sandbox-tools.ts'],
-  pool: { maxWorkers: 3, idleTtlMs: 60_000 },          // 默认池化；0 = 每次独立进程
-});
-
-const runtime = createRuntime({
-  // ...model / streamFn
-  workspace: '/path/to/project',
-  sandbox: {
-    provider,
-    defaults: { resources: { wallClockMs: 30_000 }, net: { mode: 'deny' } },
-  },
-  telemetry: {
-    onSandboxEvent(info) {
-      // type: spawn / exit / killed / violation / degraded / limit
-      console.log('[sandbox]', info.type, info.toolName, info.detail ?? '');
-    },
-  },
-});`,
-  },
-  {
-    id: 'createDefaultSandboxProvider',
-    name: 'createDefaultSandboxProvider()',
-    kind: 'function',
-    signature: 'createDefaultSandboxProvider(options?): SandboxProvider',
-    description: '默认沙箱 provider 工厂：subprocess 路由 SubprocessSandboxProvider；os 按平台分派（Linux → Bubblewrap，macOS → Seatbelt/sandbox-exec，Windows 无 OS 级沙箱自动降级 subprocess）；microvm 恒未实现（预留）。supports() 走真实探测（如 Linux 内部构造最小 bwrap 沙箱验证 userns/mountns），探测失败如实降级而不是假支持。',
-    category: '工具沙箱',
-    params: [
-      { name: 'options', type: 'DefaultSandboxProviderOptions', description: '透传给各平台 provider 的交集选项（workerPath / nodeArgs / toolModules / pool 等）' },
-    ],
-    returns: 'SandboxProvider 实例，可传给 RuntimeOptions.sandbox.provider',
-    example: `import { createDefaultSandboxProvider, probeLinuxSandboxCaps } from '@aipack-ai/agent';
-
-const provider = createDefaultSandboxProvider({ toolModules: ['./tools.js'] });
-
-// 能力探测（Linux 返回 bwrap / cgroup v2 / systemd-run 明细）
-console.log(await provider.supports('os'), await provider.supports('subprocess'));
-const caps = await probeLinuxSandboxCaps();  // Linux 平台明细`,
-  },
-  {
-    id: 'SubprocessSandboxProvider',
-    name: 'SubprocessSandboxProvider',
-    kind: 'class',
-    signature: 'new SubprocessSandboxProvider(options?: SubprocessSandboxProviderOptions)',
-    description: 'Tier 1 进程隔离沙箱 provider：每次 exec 在独立 Node worker 子进程中执行工具，宿主与 worker 间走 NDJSON 协议（stdin/stdout 每行一条 JSON，stderr 仅诊断），心跳 5s、15s 无消息判僵死强杀并杀整个进程树（POSIX kill(-pid) / Windows taskkill /T /F，防子进程逃逸）。fs 约束为进程内 facade 拦截（软约束，ESM 命名 fs import 也被 hook），网络 Tier 1 不拦截（强隔离用 os 策略）；工具 console.log 全部转发 stderr 防污染协议通道。默认 worker 池化（maxWorkers 3，idle 60s 回收；violation 污染或死亡的 worker 不复用）。',
-    category: '工具沙箱',
-    params: [
-      { name: 'options.workerPath', type: 'string', description: 'worker 入口路径；缺省解析 dist 产物，也可用 AIPACK_SANDBOX_WORKER 环境变量指定' },
-      { name: 'options.nodeArgs', type: 'string[]', description: 'worker 启动参数，如 ["--import", "tsx"] 让 TS 工具模块直接运行' },
-      { name: 'options.toolModules', type: 'string[]', description: 'worker 加载的工具模块路径' },
-      { name: 'options.heartbeatTimeoutMs', type: 'number', description: '心跳超时（默认 15000ms），超时判僵死强杀' },
-      { name: 'options.pool', type: 'SubprocessPoolOptions', description: '{ maxWorkers?: 3, idleTtlMs?: 60000 }；maxWorkers 0 关闭池化，每次独立 spawn' },
-    ],
-    example: `import { SubprocessSandboxProvider } from '@aipack-ai/agent';
-
-const provider = new SubprocessSandboxProvider({
-  toolModules: ['./dist/tools.js'],
-  pool: { maxWorkers: 3, idleTtlMs: 60_000 },
-});
-
-console.log(await provider.supports('subprocess')); // worker 入口可用即 true
-// 用完回收池
-await provider.close();`,
   },
 ];
 

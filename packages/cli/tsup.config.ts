@@ -4,8 +4,6 @@ export default defineConfig({
   entry: {
     bin: 'src/bin.ts',
     index: 'index.ts',
-    // 沙箱 worker 按名重建注册表的独立模块（--sandbox 时 toolModules 指向 dist/tools.js）
-    tools: 'src/tools.ts',
   },
   format: ['esm'],
   target: 'es2022',

@@ -14,7 +14,6 @@ import {
   ApartmentOutlined,
   CodeOutlined,
   CheckCircleOutlined,
-  LockOutlined,
 } from '@ant-design/icons';
 import CodeBlock from '../components/CodeBlock';
 import {
@@ -28,7 +27,6 @@ import {
   cliCompactionCode,
   cliSlashCommandsCode,
   cliPermissionCode,
-  cliSandboxCode,
   cliApiCode,
   cliEnvCode,
 } from '../data/cliCode';
@@ -55,11 +53,6 @@ const featureCards = [
     icon: <ApartmentOutlined />,
     title: '子 agent（task）',
     desc: '隔离上下文执行子任务并只返回报告，同回合并行、防递归、权限复用',
-  },
-  {
-    icon: <LockOutlined />,
-    title: '工具沙箱',
-    desc: '--sandbox 基线（os / subprocess / off），声明沙箱的工具在独立进程内执行：fs 白名单、env 白名单、资源限额，能力不足自动降级',
   },
   {
     icon: <FileTextOutlined />,
@@ -102,7 +95,7 @@ export default function CliPage() {
       </h1>
       <p className="section-subtitle">
         <b>@aipack-ai/cli</b> 基于 aipack 框架的终端 AI 编程助手。内置文件读写、shell、检索与
-        task 子 agent 工具，支持项目记忆文件、Skills、MCP、Hooks、工具沙箱与策略管道上下文压缩；
+        task 子 agent 工具，支持项目记忆文件、Skills、MCP、Hooks 与策略管道上下文压缩；
         默认权限策略对正常操作零打断、仅危险命令需确认。
       </p>
 
@@ -260,33 +253,10 @@ export default function CliPage() {
 
       <Divider style={{ margin: '40px 0' }} />
 
-      {/* 11. 工具沙箱 */}
-      <div id="sandbox" style={{ scrollMarginTop: 100 }}>
-        <h2 className="subsection-title">
-          <LockOutlined /> 11. 工具沙箱
-        </h2>
-        <Paragraph style={{ lineHeight: 1.8, color: '#475569' }}>
-          <code>--sandbox</code> 设置工具沙箱基线（默认 off，零迁移）。声明了沙箱的工具在独立进程中执行：
-          fs 前缀白名单 + deny 显式拒绝、env 白名单注入、secrets 凭证按需发放、资源限额超限强杀进程树。
-          与权限正交：<b>权限 = 事前授权（fail-closed），沙箱 = 事中约束（fail-open 降级 + 告警）</b>。
-          <code>aipack doctor</code> 会做沙箱能力探测与策略降级矩阵输出。
-        </Paragraph>
-        <CodeBlock code={cliSandboxCode} language="bash" />
-        <Alert
-          type="info"
-          showIcon
-          message="能力不足自动降级"
-          description="隔离强度 inprocess < subprocess < os < microvm（未实现）。--sandbox os 在 Linux（bwrap）或 macOS（Seatbelt）不可用时会自动降级到 subprocess 并提示；违规/限额/降级事件均写 stderr 可观测。"
-          style={{ marginTop: 16 }}
-        />
-      </div>
-
-      <Divider style={{ margin: '40px 0' }} />
-
-      {/* 12. 可编程 API */}
+      {/* 11. 可编程 API */}
       <div id="api" style={{ scrollMarginTop: 100 }}>
         <h2 className="subsection-title">
-          <ApiOutlined /> 12. 可编程 API 与环境变量
+          <ApiOutlined /> 11. 可编程 API 与环境变量
         </h2>
         <Paragraph style={{ lineHeight: 1.8, color: '#475569' }}>
           <code>@aipack-ai/cli</code> 同时导出参数解析、Runtime 组装与运行模式，可在自己的 Node 程序里复用整套 CLI 能力。

@@ -101,8 +101,7 @@ export class AgentRuntime implements Runtime {
   /** 审批等待超时（毫秒） */
   private _approvalTimeoutMs: number;
   /** traceId 生成器（测试可注入确定性 id） */
-  private readonly _traceIdGenerator: (() => string) | undefined;
-  private readonly _sandbox: import('../core').SandboxOptions | undefined;
+  private _traceIdGenerator: (() => string) | undefined;
 
   // ─── 协作模块（构造时组装，职责见文件头注释） ───────────────────
 
@@ -149,7 +148,6 @@ export class AgentRuntime implements Runtime {
     this._approvals = options.approvals;
     this._approvalTimeoutMs = options.approvalTimeoutMs ?? 300_000;
     this._traceIdGenerator = options.traceIdGenerator;
-    this._sandbox = options.sandbox;
 
     // 注册初始工具
     if (options.tools) {
@@ -188,8 +186,6 @@ export class AgentRuntime implements Runtime {
       defaultSessionKey: this._sessionKey,
       getTools: () => this._globalTools,
       getShared: () => this._extensionContext?.shared,
-      sandbox: this._sandbox,
-      workspace: options.workspace,
     });
     this._compactor = new ContextCompactor({
       telemetry: this._emitter,
