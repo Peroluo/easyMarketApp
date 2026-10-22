@@ -153,6 +153,17 @@ const observabilityMenu: MenuItem[] = [
   },
 ];
 
+const langfuseMenu: MenuItem[] = [
+  { key: '/langfuse#overview', label: '总览', icon: <RocketOutlined /> },
+  { key: '/langfuse#quickstart', label: '1. 快速开始', icon: <ThunderboltOutlined /> },
+  { key: '/langfuse#setup', label: '2. 接入方式', icon: <ApiOutlined /> },
+  { key: '/langfuse#mapping', label: '3. Trace 映射', icon: <NodeIndexOutlined /> },
+  { key: '/langfuse#robust', label: '4. 容错与内存安全', icon: <SafetyCertificateOutlined /> },
+  { key: '/langfuse#transport', label: '5. 自定义 Transport', icon: <CodeOutlined /> },
+  { key: '/langfuse#deploy', label: '6. 本地自托管部署', icon: <CloudServerOutlined /> },
+  { key: '/langfuse#config', label: '7. 配置全览', icon: <SettingOutlined /> },
+];
+
 const memoryMenu: MenuItem[] = [
   { key: '/memory#overview', label: '总览', icon: <RocketOutlined /> },
   { key: '/memory#quickstart', label: '1. 快速开始', icon: <ThunderboltOutlined /> },
@@ -266,6 +277,7 @@ const packagesMenu: MenuItem[] = [
   { key: '/packages#aipack-eval', label: 'aipack-eval', icon: <ExperimentOutlined /> },
   { key: '/packages#aipack-observability', label: 'aipack-observability', icon: <LineChartOutlined /> },
   { key: '/packages#aipack-observability-server', label: 'aipack-observability-server', icon: <CloudServerOutlined /> },
+  { key: '/packages#aipack-agent-langfuse', label: 'aipack-agent-langfuse', icon: <LineChartOutlined /> },
   { key: '/packages#aipack-cli', label: 'aipack-cli', icon: <SettingOutlined /> },
 ];
 
@@ -288,6 +300,7 @@ export default function DocsLayout({ children }: DocsLayoutProps) {
     else if (path === '/api' || path.startsWith('/api')) items = apiMenu;
     else if (path === '/extend' || path.startsWith('/extend')) items = extendMenu;
     else if (path === '/observability' || path.startsWith('/observability')) items = observabilityMenu;
+    else if (path === '/langfuse' || path.startsWith('/langfuse')) items = langfuseMenu;
     else if (path === '/memory' || path.startsWith('/memory')) items = memoryMenu;
     else if (path === '/skills' || path.startsWith('/skills')) items = skillsMenu;
     else if (path === '/mcp' || path.startsWith('/mcp')) items = mcpMenu;
@@ -315,6 +328,7 @@ export default function DocsLayout({ children }: DocsLayoutProps) {
     if (rootPath === '/api') return apiMenu;
     if (rootPath === '/extend') return extendMenu;
     if (rootPath === '/observability') return observabilityMenu;
+    if (rootPath === '/langfuse') return langfuseMenu;
     if (rootPath === '/memory') return memoryMenu;
     if (rootPath === '/skills') return skillsMenu;
     if (rootPath === '/mcp') return mcpMenu;

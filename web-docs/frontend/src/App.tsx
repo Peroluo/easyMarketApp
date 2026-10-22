@@ -9,6 +9,7 @@ import ExtendPage from './pages/ExtendPage';
 import ExamplesPage from './pages/ExamplesPage';
 import PackagesPage from './pages/PackagesPage';
 import ObservabilityPage from './pages/ObservabilityPage';
+import LangfusePage from './pages/LangfusePage';
 import MemoryPage from './pages/MemoryPage';
 import MultiAgentPage from './pages/MultiAgentPage';
 import SkillsPage from './pages/SkillsPage';
@@ -122,6 +123,14 @@ export default function App() {
           element={
             <DocsLayout>
               <CompressionPage />
+            </DocsLayout>
+          }
+        />
+        <Route
+          path="/langfuse"
+          element={
+            <DocsLayout>
+              <LangfusePage />
             </DocsLayout>
           }
         />

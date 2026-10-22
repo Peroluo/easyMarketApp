@@ -29,6 +29,7 @@ const navItems = [
   { path: '/extend', label: '扩展指南', icon: <CodeOutlined /> },
   { path: '/compression', label: '上下文压缩', icon: <AimOutlined /> },
   { path: '/observability', label: '可观测性', icon: <LineChartOutlined /> },
+  { path: '/langfuse', label: 'Langfuse', icon: <AimOutlined /> },
   { path: '/memory', label: '持久化记忆', icon: <DatabaseOutlined /> },
   { path: '/skills', label: 'Agent Skills', icon: <TagsOutlined /> },
   { path: '/multi-agent', label: '多Agent编排', icon: <ApartmentOutlined /> },
@@ -41,7 +42,7 @@ const navItems = [
 const GITHUB_URL = 'https://github.com/luoguoxiong/aipack';
 
 // 桌面端导航拆分：高频页面平铺，其余收进「更多」下拉，避免头部拥挤
-const MORE_PATHS = ['/eval', '/mcp', '/multi-agent', '/examples', '/packages', '/observability', '/memory'];
+const MORE_PATHS = ['/eval', '/mcp', '/multi-agent', '/examples', '/packages', '/observability', '/langfuse', '/memory'];
 const primaryNavItems = navItems.filter((item) => !MORE_PATHS.includes(item.path));
 const moreNavItems = navItems.filter((item) => MORE_PATHS.includes(item.path));
 
