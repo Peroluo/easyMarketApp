@@ -243,6 +243,14 @@ export class AgentRuntime implements Runtime {
       sessionKey: runtime._sessionKey,
       shared: new Map(),
       runtime,
+      // 遥测访问器：emitter 实例不变，底层 Telemetry 可被 Extension 替换（如 Langfuse 包装）
+      telemetry: {
+        get: () => runtime._emitter.getTelemetry(),
+        set: next => {
+          runtime._telemetry = next;
+          runtime._emitter.setTelemetry(next);
+        },
+      },
     };
     runtime._extensionContext = ctx;
     runtime._extensions.applyAll(ctx);

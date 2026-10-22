@@ -12,6 +12,7 @@ import type { Context } from './types';
 import type { ContextResource } from './context-resource';
 import type { BeforeToolCallDecision, AfterToolCallDecision } from './tool-hooks';
 import type { Runtime } from './runtime';
+import type { Telemetry } from './telemetry';
 
 // ─── Runtime 钩子集合 ─────────────────────────────────────────────
 
@@ -96,6 +97,19 @@ export interface ExtensionContext {
    * 由 AgentRuntime.create 注入；自建 ExtensionContext 时可缺省。
    */
   readonly runtime?: Runtime;
+  /**
+   * 运行时遥测访问器（可选）。Telemetry 经 RuntimeOptions.telemetry 注入，
+   * emitter 在 Runtime 构造期即被各协作模块按引用共享；Extension 若需在
+   * apply 阶段包装/替换底层 Telemetry（如接入 Langfuse 等 APM），通过本
+   * 访问器读写——emitter 实例不变，替换对所有模块透明。
+   * 由 AgentRuntime.create 注入；自建 ExtensionContext 时可缺省。
+   */
+  readonly telemetry?: {
+    /** 当前生效的 Telemetry（RuntimeOptions 未注入时为 undefined） */
+    get(): Telemetry | undefined;
+    /** 替换底层 Telemetry（后续所有遥测事件流向新实现） */
+    set(next: Telemetry | undefined): void;
+  };
 }
 
 // ─── Extension 管理器 ─────────────────────────────────────────────

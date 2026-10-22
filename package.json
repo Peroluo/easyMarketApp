@@ -1,6 +1,6 @@
 {
   "name": "aipack",
-  "version": "1.2.3",
+  "version": "1.3.1",
   "description": "A lightweight personal AI assistant framework",
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
     "example:permission": "tsx examples/permission-approval.ts",
     "example:mcp": "tsx examples/mcp-client.ts",
     "example:mcp-server": "tsx examples/mcp-server.ts",
+    "example:langfuse": "tsx examples/langfuse-demo.ts",
     "example:ma-pipeline": "tsx examples/multi-agent-pipeline.ts",
     "example:ma-router": "tsx examples/multi-agent-router.ts",
     "example:ma-supervisor": "tsx examples/multi-agent-supervisor.ts",
@@ -51,7 +52,8 @@
     }
   },
   "dependencies": {
-    "@aipack-ai/agent": "workspace:*"
+    "@aipack-ai/agent": "workspace:*",
+    "@aipack-ai/agent-langfuse": "workspace:*"
   },
   "devDependencies": {
     "@aipack-ai/cli": "workspace:*",

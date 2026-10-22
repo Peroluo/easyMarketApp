@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/agent",
-  "version": "1.2.3",
+  "version": "1.3.1",
   "description": "Agent 框架：Runtime + Extension + Transformer，配置入口 + 执行入口",
   "type": "module",
   "main": "./dist/index.js",

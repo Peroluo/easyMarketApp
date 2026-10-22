@@ -447,3 +447,45 @@ function retryStreamFn(): StreamFn {
     yield { type: 'done', message: assistant('recovered') };
   };
 }
+
+// ─── ExtensionContext.telemetry 访问器 ─────────────────────────────
+
+describe('Telemetry: Extension 包装（ExtensionContext.telemetry）', () => {
+  it('Extension 可在 apply 阶段包装底层 Telemetry，后续事件流向包装层且原实现仍被转发', async () => {
+    const onRunEnd = mock.fn(() => undefined);
+    const wrapper = {
+      name: 'telemetry-wrapper',
+      apply(
+        _hooks: unknown,
+        context: {
+          telemetry?: {
+            get(): unknown;
+            set(next: unknown): void;
+          };
+        },
+      ) {
+        const original = context.telemetry!.get() as {
+          onRunEnd?: (info: Record<string, unknown>) => void;
+        };
+        context.telemetry!.set({
+          onRunEnd: (info: Record<string, unknown>) => {
+            info.wrapped = true;
+            original?.onRunEnd?.(info);
+          },
+        });
+      },
+    };
+
+    const runtime = createRuntime({
+      streamFn: mockStreamFn([assistant('hello')]),
+      telemetry: { onRunEnd },
+      extensions: [wrapper],
+    });
+
+    await runtime.run(createRequest('hi'));
+    assert.equal(onRunEnd.mock.callCount(), 1);
+    const info = onRunEnd.mock.calls[0].arguments[0] as Record<string, unknown>;
+    assert.equal(info.wrapped, true);
+    assert.equal(info.sessionKey, 'default');
+  });
+});

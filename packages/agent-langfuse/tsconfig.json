@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "index.ts",
+    "langfuse.ts"
+  ],
+  "exclude": ["node_modules", "dist", "test"]
+}

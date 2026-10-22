@@ -7,8 +7,12 @@
  *
  * examples 下所有需要真实 LLM 的示例都从 model.config.ts 读取配置。
  * model.config.ts 已在 .gitignore 中，不会进入版本库。
+ *
+ * Langfuse 上报配置也在本表（langfuseConfig）：
+ *   publicKey/secretKey 留空 → 上报扩展静默 no-op（离线可用）
  */
 import { getBuiltinModel, adaptAiModel, createStreamFnFromAi } from '@aipack-ai/agent';
+import { LangfuseTransport } from '@aipack-ai/agent-langfuse';
 import type { Model, StreamFn } from '@aipack-ai/agent';
 
 export interface ModelConfig {
@@ -27,6 +31,22 @@ export const modelConfig: ModelConfig = {
   modelId: 'deepseek-v4-flash',
   apiKey: 'sk-在这里填写你的密钥',
   // baseUrl: 'https://api.deepseek.com/v1',
+};
+
+/** Langfuse 上报配置（自托管地址默认 http://localhost:3000） */
+export interface LangfuseConfig {
+  /** Public Key（留空则上报 no-op） */
+  publicKey?: string;
+  /** Secret Key（留空则上报 no-op） */
+  secretKey?: string;
+  /** Langfuse 地址 */
+  baseUrl?: string;
+}
+
+export const langfuseConfig: LangfuseConfig = {
+  secretKey: 'sk-lf-f6d3e15d-ca80-487b-988a-8c1bb090f1ab',
+  publicKey: 'pk-lf-ead1abd0-a121-411d-877a-08b4765dce2d',
+  baseUrl: 'http://localhost:3000',
 };
 
 /** 环境变量前缀：deepseek → DEEPSEEK_ */
@@ -78,4 +98,25 @@ export function formatModelConfig(config: ModelConfig = resolveModelConfig()): s
   const key = config.apiKey;
   const masked = key.length > 12 ? `${key.slice(0, 6)}…${key.slice(-4)}` : '***';
   return `${config.provider}/${config.modelId} (key: ${masked})${config.baseUrl ? ` @ ${config.baseUrl}` : ''}`;
+}
+
+/** 合并 Langfuse 环境变量覆盖（LANGFUSE_PUBLIC_KEY / SECRET_KEY / BASEURL 优先） */
+export function resolveLangfuseConfig(base: LangfuseConfig = langfuseConfig): LangfuseConfig {
+  return {
+    publicKey: process.env.LANGFUSE_PUBLIC_KEY || base.publicKey,
+    secretKey: process.env.LANGFUSE_SECRET_KEY || base.secretKey,
+    baseUrl: process.env.LANGFUSE_BASEURL || base.baseUrl,
+  };
+}
+
+/** 凭据齐全 → 创建 LangfuseTransport；否则返回 undefined（调用方 no-op，离线可用） */
+export function createLangfuseTransport(
+  config: LangfuseConfig = resolveLangfuseConfig(),
+): LangfuseTransport | undefined {
+  if (!config.publicKey || !config.secretKey) return undefined;
+  return new LangfuseTransport({
+    publicKey: config.publicKey,
+    secretKey: config.secretKey,
+    baseUrl: config.baseUrl,
+  });
 }

@@ -11,9 +11,22 @@ import { newTraceId, errorClassFromMessage } from './shared';
 
 export class RuntimeTelemetry {
   constructor(
-    private readonly _telemetry: Telemetry | undefined,
+    private _telemetry: Telemetry | undefined,
     private readonly _traceIdGenerator?: () => string,
   ) {}
+
+  /** 当前底层 Telemetry（供 Extension 在 apply 阶段读取/包装） */
+  getTelemetry(): Telemetry | undefined {
+    return this._telemetry;
+  }
+
+  /**
+   * 替换底层 Telemetry（emitter 实例不变，各协作模块按引用持有的
+   * 仍是本 emitter，替换对其透明；后续 emit 流向新实现）。
+   */
+  setTelemetry(next: Telemetry | undefined): void {
+    this._telemetry = next;
+  }
 
   /** traceId 生成：优先用注入的生成器（测试可确定性） */
   newTraceId(): string {

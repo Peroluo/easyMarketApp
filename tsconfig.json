@@ -19,6 +19,7 @@
     "paths": {
       "@aipack-ai/agent": ["./packages/agent/index.ts"],
       "@aipack-ai/agent/*": ["./packages/agent/*"],
+      "@aipack-ai/agent-langfuse": ["./packages/agent-langfuse/index.ts"],
       "@aipack-ai/memory": ["./packages/memory/index.ts"],
       "@aipack-ai/compression": ["./packages/compression/index.ts"],
       "@aipack-ai/observability": ["./packages/observability/src/index.ts"],

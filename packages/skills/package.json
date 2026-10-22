@@ -1,6 +1,6 @@
 {
   "name": "@aipack-ai/skills",
-  "version": "1.2.3",
+  "version": "1.3.1",
   "description": "aipack Agent Skills 插件：SKILL.md 加载 + 渐进式披露 + skill 工具，Extension 机制接入",
   "type": "module",
   "main": "./dist/index.js",
